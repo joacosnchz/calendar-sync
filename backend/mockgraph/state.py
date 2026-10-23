@@ -1,0 +1,692 @@
+"""In-memory directory, calendars, subscriptions and notification delivery."""
+
+import asyncio
+import base64
+import json
+import logging
+import os
+import pickle
+import secrets
+import uuid
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import httpx
+
+from app.sync.events import resolve_tz
+
+log = logging.getLogger("mockgraph")
+
+MAX_SUBSCRIPTION_MINUTES = 4230
+
+
+def now_utc() -> datetime:
+    return datetime.now(UTC)
+
+
+def graph_dt(dt: datetime) -> str:
+    # Graph uses 7 fractional digits.
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "0"
+
+
+def iso_z(dt: datetime) -> str:
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_any(value: str) -> datetime:
+    value = value.strip().replace("Z", "+00:00")
+    if "." in value:
+        head, rest = value.split(".", 1)
+        digits = len(rest) - len(rest.lstrip("0123456789"))
+        value = f"{head}.{rest[:digits][:6].ljust(6, '0')}{rest[digits:]}"
+    dt = datetime.fromisoformat(value)
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+def to_utc(value: dict[str, str], all_day: bool) -> datetime:
+    naive = parse_any(value["dateTime"]).replace(tzinfo=None)
+    if all_day:
+        return naive.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=UTC)
+    tz = resolve_tz(value.get("timeZone") or "UTC") or UTC
+    return naive.replace(tzinfo=tz).astimezone(UTC)
+
+
+def b64(data: dict) -> str:
+    return base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip("=")
+
+
+def unb64(token: str) -> dict:
+    return json.loads(base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)))
+
+
+class MockGraphError(Exception):
+    def __init__(self, status: int, code: str, message: str, headers: dict[str, str] | None = None):
+        super().__init__(message)
+        self.status, self.code, self.message, self.headers = status, code, message, headers or {}
+
+
+@dataclass
+class MockUser:
+    oid: str
+    tenant_id: str
+    upn: str
+    display_name: str
+    default_calendar_id: str = ""
+
+
+@dataclass
+class MockTenant:
+    tenant_id: str
+    name: str
+    domain: str
+    is_home: bool = False
+    consented_apps: set[str] = field(default_factory=set)
+    users: dict[str, MockUser] = field(default_factory=dict)
+    throttle_remaining: int = 0
+    drop_notifications: bool = False
+
+
+@dataclass
+class MockCalendar:
+    id: str
+    owner_oid: str
+    name: str
+    events: dict[str, dict[str, Any]] = field(default_factory=dict)
+    changes: list[tuple[int, str]] = field(default_factory=list)
+
+
+@dataclass
+class MockSubscription:
+    id: str
+    app_id: str
+    tenant_id: str
+    owner_oid: str
+    calendar_id: str
+    resource: str
+    notification_url: str
+    lifecycle_url: str | None
+    client_state: str | None
+    expiration: datetime
+    change_types: set[str]
+
+
+@dataclass
+class Delivery:
+    at: datetime
+    kind: str
+    url: str
+    status: str
+    detail: str
+
+
+def _tid(name: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"tenant.{name}"))
+
+
+def _oid(upn: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"user.{upn}"))
+
+
+class MockState:
+    def __init__(
+        self,
+        *,
+        home_tenant_id: str,
+        source_app_id: str,
+        source_app_secret: str,
+        primary_app_id: str,
+        primary_app_secret: str,
+        shared_mailbox: str,
+        token_secret: str = "mockgraph-signing-key-not-secret-0123456789",
+        inline_delivery: bool = False,
+        notify_transport: httpx.AsyncBaseTransport | None = None,
+    ):
+        self.home_tenant_id = home_tenant_id
+        self.source_app_id = source_app_id
+        self.source_app_secret = source_app_secret
+        self.primary_app_id = primary_app_id
+        self.primary_app_secret = primary_app_secret
+        self.shared_mailbox = shared_mailbox.lower()
+        self.token_secret = token_secret
+        self.inline_delivery = inline_delivery
+        self.notifier = httpx.AsyncClient(transport=notify_transport, timeout=10.0)
+        self.tenants: dict[str, MockTenant] = {}
+        self.users: dict[str, MockUser] = {}
+        self.calendars: dict[str, MockCalendar] = {}
+        self.subscriptions: dict[str, MockSubscription] = {}
+        self.codes: dict[str, dict[str, Any]] = {}
+        self.delta_sessions: dict[str, list[str]] = {}
+        self.deliveries: list[Delivery] = []
+        self.max_page_size = 50
+        self.seq = 0
+        self._tasks: set[asyncio.Task] = set()
+
+    # -- directory --------------------------------------------------------------------
+
+    def add_tenant(
+        self, name: str, domain: str, *, tenant_id: str | None = None, is_home: bool = False
+    ) -> MockTenant:
+        tenant = MockTenant(tenant_id=tenant_id or _tid(domain), name=name, domain=domain, is_home=is_home)
+        if is_home:
+            tenant.consented_apps.add(self.primary_app_id)
+        self.tenants[tenant.tenant_id] = tenant
+        return tenant
+
+    def add_user(self, tenant: MockTenant, upn: str, display_name: str) -> MockUser:
+        user = MockUser(oid=_oid(upn), tenant_id=tenant.tenant_id, upn=upn.lower(), display_name=display_name)
+        cal = MockCalendar(id=f"cal-{secrets.token_hex(8)}", owner_oid=user.oid, name="Calendar")
+        user.default_calendar_id = cal.id
+        self.calendars[cal.id] = cal
+        tenant.users[user.oid] = user
+        self.users[user.oid] = user
+        return user
+
+    def find_tenant(self, ref: str) -> MockTenant | None:
+        ref = ref.lower()
+        for t in self.tenants.values():
+            if t.tenant_id == ref or t.domain == ref:
+                return t
+        return None
+
+    def find_user(self, ref: str) -> MockUser | None:
+        ref = ref.lower()
+        if ref in self.users:
+            return self.users[ref]
+        return next((u for u in self.users.values() if u.upn == ref), None)
+
+    def user_by_upn(self, upn: str) -> MockUser:
+        user = self.find_user(upn)
+        assert user, upn
+        return user
+
+    # -- tokens -----------------------------------------------------------------------
+
+    def issue_app_token(self, tenant_ref: str, client_id: str, client_secret: str | None) -> dict[str, Any]:
+        tenant = self.find_tenant(tenant_ref)
+        if tenant is None:
+            raise MockGraphError(400, "invalid_tenant", f"AADSTS90002: Tenant '{tenant_ref}' not found.")
+        expected = {self.source_app_id: self.source_app_secret, self.primary_app_id: self.primary_app_secret}
+        if client_id not in expected:
+            raise MockGraphError(
+                400,
+                "unauthorized_client",
+                f"AADSTS700016: Application with identifier '{client_id}' was not found.",
+            )
+        if client_secret != expected[client_id]:
+            raise MockGraphError(401, "invalid_client", "AADSTS7000215: Invalid client secret provided.")
+        if client_id == self.primary_app_id and not tenant.is_home:
+            raise MockGraphError(
+                400,
+                "unauthorized_client",
+                "AADSTS700016: Application not found in the directory (single-tenant app).",
+            )
+        if client_id not in tenant.consented_apps:
+            raise MockGraphError(
+                400,
+                "unauthorized_client",
+                f"AADSTS7000229: The client application {client_id} is missing service principal in the tenant "
+                f"{tenant.tenant_id}.",
+            )
+        return {
+            "token_type": "Bearer",
+            "expires_in": 3599,
+            "access_token": self.sign({"kind": "app", "tid": tenant.tenant_id, "appid": client_id}),
+        }
+
+    def sign(self, claims: dict[str, Any]) -> str:
+        import jwt
+
+        now = int(now_utc().timestamp())
+        return jwt.encode({"iat": now, "exp": now + 3600, **claims}, self.token_secret, algorithm="HS256")
+
+    def verify(self, token: str) -> dict[str, Any]:
+        import jwt
+
+        try:
+            claims = jwt.decode(token, self.token_secret, algorithms=["HS256"])
+        except jwt.PyJWTError as exc:
+            raise MockGraphError(401, "InvalidAuthenticationToken", str(exc)) from exc
+        tenant = self.tenants.get(claims["tid"])
+        if claims.get("kind") == "app" and (tenant is None or claims["appid"] not in tenant.consented_apps):
+            raise MockGraphError(401, "InvalidAuthenticationToken", "Application access has been revoked.")
+        return claims
+
+    # -- events -----------------------------------------------------------------------
+
+    def _bump(self, cal: MockCalendar, eid: str) -> None:
+        self.seq += 1
+        cal.changes.append((self.seq, eid))
+
+    def calendar_for(self, user: MockUser, calendar_id: str | None) -> MockCalendar:
+        cid = calendar_id or user.default_calendar_id
+        cal = self.calendars.get(cid)
+        if cal is None or cal.owner_oid != user.oid:
+            raise MockGraphError(404, "ErrorItemNotFound", "The specified calendar could not be found.")
+        return cal
+
+    def find_event(self, user: MockUser, event_id: str) -> tuple[MockCalendar, dict[str, Any]]:
+        for cal in self.calendars.values():
+            if cal.owner_oid == user.oid and event_id in cal.events:
+                return cal, cal.events[event_id]
+        raise MockGraphError(404, "ErrorItemNotFound", "The specified object was not found in the store.")
+
+    def build_event(self, payload: dict[str, Any], *, ical_uid: str | None = None) -> dict[str, Any]:
+        all_day = bool(payload.get("isAllDay"))
+        start = to_utc(payload["start"], all_day)
+        end = to_utc(payload["end"], all_day)
+        now = graph_dt(now_utc())
+        return {
+            "id": "AAMk" + secrets.token_urlsafe(18).replace("-", "x").replace("_", "y"),
+            "iCalUId": ical_uid or "040000008200E00074C5B7101A82E008" + secrets.token_hex(24).upper(),
+            "type": "singleInstance",
+            "seriesMasterId": None,
+            "subject": payload.get("subject", ""),
+            "start": {"dateTime": graph_dt(start), "timeZone": "UTC"},
+            "end": {"dateTime": graph_dt(end), "timeZone": "UTC"},
+            "originalStartTimeZone": payload["start"].get("timeZone", "UTC"),
+            "originalEndTimeZone": payload["end"].get("timeZone", "UTC"),
+            "isAllDay": all_day,
+            "showAs": payload.get("showAs", "busy"),
+            "sensitivity": payload.get("sensitivity", "normal"),
+            "isCancelled": False,
+            "isReminderOn": payload.get("isReminderOn", True),
+            "location": payload.get("location") or {"displayName": ""},
+            "categories": payload.get("categories", []),
+            "body": payload.get("body") or {"contentType": "text", "content": ""},
+            "attendees": payload.get("attendees", []),
+            "transactionId": payload.get("transactionId"),
+            "singleValueExtendedProperties": payload.get("singleValueExtendedProperties", []),
+            "createdDateTime": now,
+            "lastModifiedDateTime": now,
+        }
+
+    def apply_patch(self, event: dict[str, Any], patch: dict[str, Any]) -> None:
+        all_day = bool(patch.get("isAllDay", event["isAllDay"]))
+        for key in (
+            "subject",
+            "showAs",
+            "sensitivity",
+            "location",
+            "categories",
+            "body",
+            "isReminderOn",
+            "attendees",
+            "isCancelled",
+            "singleValueExtendedProperties",
+        ):
+            if key in patch:
+                event[key] = patch[key]
+        event["isAllDay"] = all_day
+        if "start" in patch:
+            event["start"] = {"dateTime": graph_dt(to_utc(patch["start"], all_day)), "timeZone": "UTC"}
+            event["originalStartTimeZone"] = patch["start"].get("timeZone", "UTC")
+        if "end" in patch:
+            event["end"] = {"dateTime": graph_dt(to_utc(patch["end"], all_day)), "timeZone": "UTC"}
+            event["originalEndTimeZone"] = patch["end"].get("timeZone", "UTC")
+        event["lastModifiedDateTime"] = graph_dt(now_utc())
+
+    async def create_event(
+        self,
+        user: MockUser,
+        payload: dict[str, Any],
+        *,
+        calendar_id: str | None = None,
+        ical_uid: str | None = None,
+    ) -> dict[str, Any]:
+        cal = self.calendar_for(user, calendar_id)
+        txn = payload.get("transactionId")
+        if txn:
+            for existing in cal.events.values():
+                if existing.get("transactionId") == txn:
+                    return existing  # Graph de-duplicates retried creates
+        event = self.build_event(payload, ical_uid=ical_uid)
+        cal.events[event["id"]] = event
+        self._bump(cal, event["id"])
+        await self.notify(user, cal, event["id"], "created")
+        return event
+
+    async def update_event(self, user: MockUser, event_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+        cal, event = self.find_event(user, event_id)
+        self.apply_patch(event, patch)
+        self._bump(cal, event_id)
+        await self.notify(user, cal, event_id, "updated")
+        return event
+
+    async def delete_event(self, user: MockUser, event_id: str) -> None:
+        cal, _ = self.find_event(user, event_id)
+        del cal.events[event_id]
+        self._bump(cal, event_id)
+        await self.notify(user, cal, event_id, "deleted")
+
+    # -- delta ------------------------------------------------------------------------
+
+    def delta(
+        self, base_url: str, user: MockUser, calendar_id: str | None, params: dict[str, str], page_size: int
+    ):
+        page_size = max(1, min(page_size, self.max_page_size))
+        if "$skiptoken" in params:
+            tok = unb64(params["$skiptoken"])
+            ids = self.delta_sessions.get(tok["session"])
+            if ids is None:
+                raise MockGraphError(410, "SyncStateNotFound", "The sync state generation is not found.")
+            return self._delta_page(base_url, user, tok, ids, page_size)
+        if "$deltatoken" in params:
+            tok = unb64(params["$deltatoken"])
+            cal = self.calendars.get(tok["cal"])
+            if cal is None or cal.owner_oid != user.oid:
+                raise MockGraphError(410, "SyncStateNotFound", "Resync required.")
+            changed: list[str] = []
+            for seq, eid in cal.changes:
+                if seq > tok["seq"] and eid not in changed:
+                    changed.append(eid)
+            tok = {**tok, "seq_at_start": self.seq, "offset": 0, "session": secrets.token_hex(8)}
+            self.delta_sessions[tok["session"]] = changed
+            return self._delta_page(base_url, user, tok, changed, page_size)
+        start = parse_any(params["startDateTime"])
+        end = parse_any(params["endDateTime"])
+        cal = self.calendar_for(user, calendar_id)
+        ids = sorted(eid for eid, ev in cal.events.items() if self._in_window(ev, start, end))
+        tok = {
+            "cal": cal.id,
+            "start": iso_z(start),
+            "end": iso_z(end),
+            "seq_at_start": self.seq,
+            "offset": 0,
+            "session": secrets.token_hex(8),
+            "full": True,
+        }
+        self.delta_sessions[tok["session"]] = ids
+        return self._delta_page(base_url, user, tok, ids, page_size)
+
+    def _in_window(self, ev: dict[str, Any], start: datetime, end: datetime) -> bool:
+        s = parse_any(ev["start"]["dateTime"])
+        e = parse_any(ev["end"]["dateTime"])
+        return s < end and e > start and not ev.get("isCancelled")
+
+    def _delta_page(self, base_url: str, user: MockUser, tok: dict, ids: list[str], page_size: int) -> dict:
+        cal = self.calendars[tok["cal"]]
+        start, end = parse_any(tok["start"]), parse_any(tok["end"])
+        chunk = ids[tok["offset"] : tok["offset"] + page_size]
+        value = []
+        for eid in chunk:
+            ev = cal.events.get(eid)
+            if ev is not None and self._in_window(ev, start, end):
+                value.append(public_event(ev))
+            elif not tok.get("full"):
+                value.append({"id": eid, "@removed": {"reason": "deleted"}})
+        link_base = f"{base_url}/v1.0/users/{user.oid}/calendarView/delta"
+        page: dict[str, Any] = {"value": value}
+        next_offset = tok["offset"] + page_size
+        if next_offset < len(ids):
+            page["@odata.nextLink"] = f"{link_base}?$skiptoken={b64({**tok, 'offset': next_offset})}"
+        else:
+            self.delta_sessions.pop(tok["session"], None)
+            final = {"cal": cal.id, "start": tok["start"], "end": tok["end"], "seq": tok["seq_at_start"]}
+            page["@odata.deltaLink"] = f"{link_base}?$deltatoken={b64(final)}"
+        return page
+
+    # -- subscriptions ----------------------------------------------------------------
+
+    def parse_resource(self, resource: str, tenant_id: str) -> tuple[MockUser, str]:
+        parts = [p for p in resource.strip("/").split("/") if p]
+        lowered = [p.lower() for p in parts]
+        if len(parts) < 3 or lowered[0] != "users" or lowered[-1] != "events":
+            raise MockGraphError(400, "InvalidRequest", f"Unsupported resource {resource}")
+        user = self.find_user(parts[1])
+        if user is None or user.tenant_id != tenant_id:
+            raise MockGraphError(404, "ResourceNotFound", "Resource not found for the segment 'users'.")
+        if len(parts) == 5 and lowered[2] == "calendars":
+            return user, self.calendar_for(user, parts[3]).id
+        return user, user.default_calendar_id
+
+    async def validate_endpoint(self, url: str) -> None:
+        token = secrets.token_urlsafe(16)
+        try:
+            resp = await self.notifier.post(url, params={"validationToken": token}, content=b"")
+        except httpx.HTTPError as exc:
+            raise MockGraphError(
+                400, "ValidationError", f"Subscription validation request failed: {exc}"
+            ) from exc
+        if resp.status_code != 200 or resp.text != token:
+            raise MockGraphError(
+                400,
+                "ValidationError",
+                f"Subscription validation request failed. Response must exactly match "
+                f"validationToken query parameter (got HTTP {resp.status_code}).",
+            )
+        self.deliveries.append(Delivery(now_utc(), "validation", url, "ok", ""))
+
+    async def create_subscription(self, claims: dict[str, Any], body: dict[str, Any]) -> MockSubscription:
+        expiration = parse_any(body["expirationDateTime"])
+        if expiration > now_utc() + timedelta(minutes=MAX_SUBSCRIPTION_MINUTES):
+            raise MockGraphError(
+                400, "ExtensionError", "Subscription expiration can only be 4230 minutes in the future."
+            )
+        user, calendar_id = self.parse_resource(body["resource"], claims["tid"])
+        await self.validate_endpoint(body["notificationUrl"])
+        if body.get("lifecycleNotificationUrl"):
+            await self.validate_endpoint(body["lifecycleNotificationUrl"])
+        sub = MockSubscription(
+            id=str(uuid.uuid4()),
+            app_id=claims["appid"],
+            tenant_id=claims["tid"],
+            owner_oid=user.oid,
+            calendar_id=calendar_id,
+            resource=body["resource"],
+            notification_url=body["notificationUrl"],
+            lifecycle_url=body.get("lifecycleNotificationUrl"),
+            client_state=body.get("clientState"),
+            expiration=expiration,
+            change_types=set(body.get("changeType", "").split(",")),
+        )
+        self.subscriptions[sub.id] = sub
+        return sub
+
+    def subscription_json(self, sub: MockSubscription) -> dict[str, Any]:
+        return {
+            "id": sub.id,
+            "resource": sub.resource,
+            "applicationId": sub.app_id,
+            "changeType": ",".join(sorted(sub.change_types)),
+            "notificationUrl": sub.notification_url,
+            "lifecycleNotificationUrl": sub.lifecycle_url,
+            "expirationDateTime": iso_z(sub.expiration),
+            "clientState": None,
+        }
+
+    # -- notifications ----------------------------------------------------------------
+
+    async def _post(self, kind: str, url: str, payload: dict[str, Any]) -> None:
+        try:
+            resp = await self.notifier.post(url, json=payload)
+            status = str(resp.status_code)
+        except httpx.HTTPError as exc:
+            status = f"error: {exc.__class__.__name__}"
+        self.deliveries.append(Delivery(now_utc(), kind, url, status, json.dumps(payload)[:300]))
+        del self.deliveries[:-200]
+
+    async def _deliver(self, kind: str, url: str, payload: dict[str, Any]) -> None:
+        if self.inline_delivery:
+            await self._post(kind, url, payload)
+        else:
+            task = asyncio.create_task(self._post(kind, url, payload))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    async def notify(self, user: MockUser, cal: MockCalendar, event_id: str, change: str) -> None:
+        tenant = self.tenants[user.tenant_id]
+        now = now_utc()
+        for sub in list(self.subscriptions.values()):
+            if sub.owner_oid != user.oid or sub.calendar_id != cal.id or change not in sub.change_types:
+                continue
+            if sub.expiration < now:
+                continue
+            if tenant.drop_notifications:
+                self.deliveries.append(Delivery(now, "dropped", sub.notification_url, "dropped", event_id))
+                continue
+            resource = f"Users/{user.oid}/Events/{event_id}"
+            await self._deliver(
+                f"notification:{change}",
+                sub.notification_url,
+                {
+                    "value": [
+                        {
+                            "subscriptionId": sub.id,
+                            "subscriptionExpirationDateTime": iso_z(sub.expiration),
+                            "changeType": change,
+                            "resource": resource,
+                            "resourceData": {
+                                "@odata.type": "#Microsoft.Graph.Event",
+                                "@odata.id": resource,
+                                "@odata.etag": f'W/"{secrets.token_hex(4)}"',
+                                "id": event_id,
+                            },
+                            "clientState": sub.client_state,
+                            "tenantId": sub.tenant_id,
+                        }
+                    ]
+                },
+            )
+
+    async def lifecycle(self, sub: MockSubscription, event: str) -> None:
+        if not sub.lifecycle_url:
+            return
+        await self._deliver(
+            f"lifecycle:{event}",
+            sub.lifecycle_url,
+            {
+                "value": [
+                    {
+                        "subscriptionId": sub.id,
+                        "subscriptionExpirationDateTime": iso_z(sub.expiration),
+                        "tenantId": sub.tenant_id,
+                        "clientState": sub.client_state,
+                        "lifecycleEvent": event,
+                    }
+                ]
+            },
+        )
+
+    def tenant_subscriptions(self, tenant_id: str) -> list[MockSubscription]:
+        return [s for s in self.subscriptions.values() if s.tenant_id == tenant_id]
+
+    async def send_lifecycle(self, tenant_id: str, event: str) -> int:
+        subs = self.tenant_subscriptions(tenant_id)
+        for sub in subs:
+            await self.lifecycle(sub, event)
+            if event == "subscriptionRemoved":
+                self.subscriptions.pop(sub.id, None)
+        return len(subs)
+
+    async def revoke_consent(self, tenant_id: str, app_id: str) -> None:
+        """Simulates the customer admin deleting our Enterprise application."""
+        tenant = self.tenants[tenant_id]
+        tenant.consented_apps.discard(app_id)
+        for sub in self.tenant_subscriptions(tenant_id):
+            if sub.app_id == app_id:
+                await self.lifecycle(sub, "subscriptionRemoved")
+                self.subscriptions.pop(sub.id, None)
+
+    # -- persistence (so a container restart doesn't forget consent and mailboxes) -----
+
+    _PERSISTED = ("tenants", "users", "calendars", "subscriptions", "seq", "deliveries")
+
+    def save(self, path: str) -> None:
+        tmp = f"{path}.tmp"
+        with open(tmp, "wb") as fh:
+            pickle.dump({k: getattr(self, k) for k in self._PERSISTED}, fh)
+        os.replace(tmp, path)
+
+    def load(self, path: str) -> bool:
+        if not os.path.exists(path):
+            return False
+        with open(path, "rb") as fh:
+            data = pickle.load(fh)  # noqa: S301 - our own file on a private volume
+        for key in self._PERSISTED:
+            setattr(self, key, data[key])
+        return True
+
+    async def drain(self) -> None:
+        while self._tasks:
+            await asyncio.gather(*list(self._tasks), return_exceptions=True)
+
+
+def public_event(event: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in event.items() if k not in ("singleValueExtendedProperties",)}
+
+
+def seed(state: MockState) -> None:
+    """Demo directory: our host tenant plus three customer tenants."""
+    home = state.add_tenant(
+        "Calendar Sync (host)", "calsync.example", tenant_id=state.home_tenant_id, is_home=True
+    )
+    state.add_user(home, state.shared_mailbox, "Unified Calendars")
+    state.add_user(home, "ops@calsync.example", "Olivia Operator")
+
+    contoso = state.add_tenant("Contoso", "contoso.example")
+    fabrikam = state.add_tenant("Fabrikam", "fabrikam.example")
+    northwind = state.add_tenant("Northwind Traders", "northwind.example")
+    state.add_user(contoso, "alice@contoso.example", "Alice Martin")
+    state.add_user(contoso, "bob@contoso.example", "Bob Ito")
+    state.add_user(fabrikam, "alice@fabrikam.example", "Alice Martin (Fabrikam board)")
+    state.add_user(fabrikam, "carol@fabrikam.example", "Carol Diaz")
+    state.add_user(northwind, "alice@northwind.example", "Alice Martin (Northwind)")
+    state.add_user(northwind, "dave@northwind.example", "Dave Kim")
+
+
+async def seed_events(state: MockState) -> None:
+    today = now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def at(day: int, hour: int, minutes: int = 0) -> dict[str, str]:
+        return {
+            "dateTime": (today + timedelta(days=day, hours=hour, minutes=minutes)).strftime(
+                "%Y-%m-%dT%H:%M:%S"
+            ),
+            "timeZone": "UTC",
+        }
+
+    alice_c = state.user_by_upn("alice@contoso.example")
+    alice_f = state.user_by_upn("alice@fabrikam.example")
+    alice_n = state.user_by_upn("alice@northwind.example")
+    await state.create_event(
+        alice_c,
+        {
+            "subject": "Contoso weekly sync",
+            "start": at(0, 14),
+            "end": at(0, 15),
+            "location": {"displayName": "Teams"},
+            "attendees": [{"emailAddress": {"address": "bob@contoso.example"}}],
+        },
+    )
+    await state.create_event(
+        alice_c, {"subject": "Budget review", "start": at(1, 9), "end": at(1, 10, 30), "showAs": "tentative"}
+    )
+    await state.create_event(
+        alice_f,
+        {
+            "subject": "Fabrikam board meeting",
+            "start": at(1, 10),
+            "end": at(1, 12),
+            "location": {"displayName": "HQ, Room 4"},
+        },
+    )
+    await state.create_event(
+        alice_n,
+        {
+            "subject": "Northwind offsite",
+            "start": at(3, 0),
+            "end": at(4, 0),
+            "isAllDay": True,
+            "showAs": "oof",
+        },
+    )
+    # One meeting that appears in two of Alice's calendars (same iCalUId): mirrored once.
+    shared = await state.create_event(
+        alice_c, {"subject": "Contoso x Fabrikam partnership", "start": at(2, 15), "end": at(2, 16)}
+    )
+    await state.create_event(
+        alice_f,
+        {"subject": "Contoso x Fabrikam partnership", "start": at(2, 15), "end": at(2, 16)},
+        ical_uid=shared["iCalUId"],
+    )

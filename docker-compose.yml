@@ -1,0 +1,124 @@
+name: calendar-sync
+
+x-backend: &backend
+  build: ./backend
+  image: calendar-sync-backend:local
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql+asyncpg://calsync:${POSTGRES_PASSWORD:-calsync}@db:5432/calsync
+    REDIS_URL: redis://redis:6379/0
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: calsync
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-calsync}
+      POSTGRES_DB: calsync
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/scripts/create-test-db.sql:/docker-entrypoint-initdb.d/10-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U calsync -d calsync"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # The queue. AOF persistence so queued jobs survive a restart.
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    <<: *backend
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Webhook receiver + REST API. Validates and enqueues only; never calls Graph inline
+  # for notifications.
+  api:
+    <<: *backend
+    command: ["uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers",
+              "--forwarded-allow-ips", "*"]
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Queue consumers: fetch-on-notify, delta sync, mirror writes, subscriptions.
+  # Scale horizontally: docker compose up --scale worker=4
+  worker:
+    <<: *backend
+    command: ["arq", "app.worker.settings.WorkerSettings"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "arq", "--check", "app.worker.settings.WorkerSettings"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Cron sweeps: subscription renewal, periodic delta, mirror audit. Only enqueues work.
+  scheduler:
+    <<: *backend
+    command: ["arq", "app.worker.settings.SchedulerSettings"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        API_INTERNAL_URL: http://api:8000
+    image: calendar-sync-web:local
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Local stand-in for login.microsoftonline.com + graph.microsoft.com.
+  # Enabled with COMPOSE_PROFILES=mock (the default in .env.example).
+  mockgraph:
+    <<: *backend
+    profiles: ["mock"]
+    command: ["uvicorn", "mockgraph.main:app", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      MOCKGRAPH_STATE_FILE: /data/mockgraph.pickle
+    volumes:
+      - mockdata:/data
+    ports:
+      - "${MOCKGRAPH_PORT:-8001}:8001"
+
+volumes:
+  pgdata:
+  redisdata:
+  mockdata:

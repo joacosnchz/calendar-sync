@@ -1,0 +1,53 @@
+[project]
+name = "calendar-sync"
+version = "0.1.0"
+description = "Unified Microsoft 365 calendar: mirrors source calendars across tenants into one primary calendar per user."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.161",
+    "uvicorn[standard]>=0.54",
+    "sqlalchemy[asyncio]>=2.1",
+    "asyncpg>=0.32",
+    "alembic>=1.20",
+    "pydantic-settings>=2.16",
+    "httpx>=0.28",
+    "arq>=0.28",
+    "redis>=5.2",
+    "cryptography>=46",
+    "pyjwt>=2.15",
+    "prometheus-client>=0.21",
+    "tzlocal>=5.4",
+    "python-multipart>=0.0.20",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4",
+    "pytest-asyncio>=1.4",
+    "ruff>=0.14",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app", "mockgraph"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC"]
+ignore = ["B008", "E501"]  # line length is enforced by `ruff format`
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*" = ["ASYNC109", "ASYNC110"]  # polling a running stack with a deadline is the point

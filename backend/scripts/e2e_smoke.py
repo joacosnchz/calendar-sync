@@ -1,0 +1,286 @@
+"""End-to-end smoke test against a running stack (docker compose, mock profile).
+
+Drives the real services the way a browser would: OAuth redirects, cookies, admin
+consent, then changes in the mock Graph control panel, and checks each change reaches
+the user's primary calendar. Needs a fresh stack (it onboards tenants and signs users up). Run from the host
+network so localhost URLs resolve:
+
+    docker compose down -v && docker compose up -d --build
+    docker run --rm --network host calendar-sync-backend:local python scripts/e2e_smoke.py
+"""
+
+import argparse
+import asyncio
+import sys
+import time
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
+from urllib.parse import parse_qs, urlparse
+
+import httpx
+
+PRIMARY_MAILBOX = "calendars@calsync.example"
+CSRF = {"x-calsync-csrf": "1"}
+
+
+class Smoke:
+    def __init__(self, web: str, mock: str):
+        self.web = web.rstrip("/")
+        self.mock = mock.rstrip("/")
+        self.failures = 0
+
+    def browser(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(follow_redirects=False, timeout=15, headers=CSRF)
+
+    async def follow(self, client: httpx.AsyncClient, url: str) -> httpx.Response:
+        for _ in range(10):
+            resp = await client.get(url)
+            if resp.status_code not in (302, 303, 307):
+                return resp
+            url = resp.headers["location"]
+        raise RuntimeError("redirect loop")
+
+    async def oauth(self, client: httpx.AsyncClient, start: str, upn: str) -> str:
+        """Run a sign-in round trip and return the final URL the browser lands on."""
+        resp = await client.get(f"{self.web}{start}")
+        assert resp.status_code in (302, 307), resp.text
+        query = {k: v[0] for k, v in parse_qs(urlparse(resp.headers["location"]).query).items()}
+        oid = next(u["oid"] for u in await self.users() if u["upn"] == upn)
+        resp = await client.get(f"{self.mock}/mock/authorize/complete", params={**query, "oid": oid})
+        resp = await client.get(resp.headers["location"])  # our /auth/callback
+        return resp.headers.get("location", "")
+
+    async def users(self) -> list[dict]:
+        async with httpx.AsyncClient() as c:
+            state = (await c.get(f"{self.mock}/mock/state")).json()
+        return [{"upn": cal["owner"], "oid": cal["owner_oid"]} for cal in state["calendars"].values()]
+
+    async def state(self) -> dict:
+        async with httpx.AsyncClient() as c:
+            return (await c.get(f"{self.mock}/mock/state")).json()
+
+    async def mirrors(self) -> list[dict]:
+        state = await self.state()
+        return [
+            e
+            for cal in state["calendars"].values()
+            if cal["owner"] == PRIMARY_MAILBOX and cal["name"] != "Calendar"
+            for e in cal["events"]
+        ]
+
+    async def consent(self, url: str, tenant_id: str) -> str:
+        query = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
+        async with self.browser() as c:
+            resp = await c.post(
+                f"{self.mock}/mock/adminconsent/complete",
+                data={**query, "tenant_id": tenant_id, "decision": "approve"},
+            )
+            resp = await c.get(resp.headers["location"])
+            return resp.headers["location"]
+
+    async def check(self, name: str, fn: Callable[[], Awaitable[str | None]]) -> None:
+        started = time.perf_counter()
+        try:
+            detail = await fn()
+            print(f"  PASS  {name} ({time.perf_counter() - started:.1f}s){f' — {detail}' if detail else ''}")
+        except Exception as exc:  # noqa: BLE001 - report and keep going
+            self.failures += 1
+            print(f"  FAIL  {name}: {exc!r}")
+
+    async def wait_for(self, predicate: Callable[[list[dict]], bool], timeout: float = 20) -> float:
+        started = time.perf_counter()
+        while time.perf_counter() - started < timeout:
+            if predicate(await self.mirrors()):
+                return time.perf_counter() - started
+            await asyncio.sleep(0.2)
+        raise TimeoutError(
+            f"condition not met within {timeout}s; mirrors={[m['subject'] for m in await self.mirrors()]}"
+        )
+
+
+def day(offset: int) -> str:
+    """A date inside the sync window."""
+    return (datetime.now(UTC) + timedelta(days=offset)).strftime("%Y-%m-%d")
+
+
+def subjects(mirrors: list[dict]) -> set[str]:
+    return {m["subject"] for m in mirrors}
+
+
+async def main(web: str, mock: str) -> int:
+    s = Smoke(web, mock)
+    state = await s.state()
+    tenants = {v["name"]: k for k, v in state["tenants"].items()}
+    print(f"Smoke test against {web} (mock Graph at {mock})")
+
+    operator, alice = s.browser(), s.browser()
+
+    async def operator_signs_in() -> str:
+        landed = await s.oauth(operator, "/auth/login", "ops@calsync.example")
+        me = (await operator.get(f"{web}/api/me")).json()
+        assert me["is_operator"], me
+        return landed
+
+    async def onboard(name: str) -> Callable[[], Awaitable[str]]:
+        async def run() -> str:
+            tenant = (await operator.post(f"{web}/api/admin/tenants", json={"display_name": name})).json()
+            landed = await s.consent(tenant["consent_url"], tenants[name])
+            assert "status=connected" in landed, landed
+            return landed.split("?")[1]
+
+        return run
+
+    async def alice_signs_in_and_links() -> str:
+        await s.oauth(alice, "/auth/login", "alice@contoso.example")
+        for upn in ("alice@contoso.example", "alice@fabrikam.example"):
+            landed = await s.oauth(alice, "/auth/link", upn)
+            assert "status=linked" in landed, landed
+        return "2 sources linked"
+
+    async def backfill() -> str:
+        took = await s.wait_for(
+            lambda m: (
+                {
+                    "[Contoso] Contoso weekly sync",
+                    "[Fabrikam] Fabrikam board meeting",
+                    "[Contoso · Fabrikam] Contoso x Fabrikam partnership",
+                }
+                <= subjects(m)
+            )
+        )
+        mirrors = await s.mirrors()
+        assert all(not m["attendees"] for m in mirrors), "a mirror has attendees"
+        assert sum("partnership" in m["subject"] for m in mirrors) == 1, "duplicate meeting mirrored twice"
+        return f"{len(mirrors)} mirrors in {took:.1f}s, none with attendees, shared meeting mirrored once"
+
+    async def create_event() -> str:
+        async with httpx.AsyncClient() as c:
+            await c.post(
+                f"{mock}/mock/events",
+                data={
+                    "mailbox_upn": "alice@contoso.example",
+                    "subject": "Smoke: new meeting",
+                    "date": day(2),
+                    "time": "09:00",
+                    "tz": "Pacific Standard Time",
+                    "minutes": "45",
+                },
+            )
+        took = await s.wait_for(lambda m: "[Contoso] Smoke: new meeting" in subjects(m))
+        mirror = next(m for m in await s.mirrors() if m["subject"].endswith("Smoke: new meeting"))
+        assert mirror["originalStartTimeZone"] == "Pacific Standard Time", mirror
+        return f"change-to-mirror latency {took:.2f}s, written in original time zone"
+
+    async def find_source_event(subject: str) -> tuple[str, str]:
+        st = await s.state()
+        for cal in st["calendars"].values():
+            for e in cal["events"]:
+                if e["subject"] == subject and cal["owner"] != PRIMARY_MAILBOX:
+                    return cal["owner_oid"], e["id"]
+        raise LookupError(subject)
+
+    async def update_event() -> str:
+        oid, eid = await find_source_event("Smoke: new meeting")
+        async with httpx.AsyncClient() as c:
+            await c.post(f"{mock}/mock/events/{oid}/{eid}", data={"action": "rename"})
+        took = await s.wait_for(lambda m: "[Contoso] Smoke: new meeting (updated)" in subjects(m))
+        return f"{took:.2f}s"
+
+    async def delete_event() -> str:
+        oid, eid = await find_source_event("Smoke: new meeting (updated)")
+        async with httpx.AsyncClient() as c:
+            await c.post(f"{mock}/mock/events/{oid}/{eid}", data={"action": "delete"})
+        took = await s.wait_for(lambda m: not any("Smoke: new meeting" in x for x in subjects(m)))
+        return f"{took:.2f}s"
+
+    async def missed_notifications() -> str:
+        contoso = tenants["Contoso"]
+        async with httpx.AsyncClient() as c:
+            await c.post(f"{mock}/mock/tenants/{contoso}", data={"action": "drop"})
+            await c.post(
+                f"{mock}/mock/events",
+                data={"mailbox_upn": "alice@contoso.example", "subject": "Smoke: dropped", "date": day(3)},
+            )
+            await asyncio.sleep(2)
+            assert "[Contoso] Smoke: dropped" not in subjects(await s.mirrors()), (
+                "notification was not dropped"
+            )
+            await c.post(f"{mock}/mock/tenants/{contoso}", data={"action": "drop"})
+            await c.post(f"{mock}/mock/tenants/{contoso}", data={"action": "missed"})
+        took = await s.wait_for(lambda m: "[Contoso] Smoke: dropped" in subjects(m))
+        return f"recovered by delta {took:.2f}s after 'missed'"
+
+    async def throttled() -> str:
+        fabrikam = tenants["Fabrikam"]
+        async with httpx.AsyncClient() as c:
+            await c.post(f"{mock}/mock/tenants/{fabrikam}", data={"action": "throttle"})
+            await c.post(
+                f"{mock}/mock/events",
+                data={"mailbox_upn": "alice@fabrikam.example", "subject": "Smoke: throttled", "date": day(4)},
+            )
+        took = await s.wait_for(lambda m: "[Fabrikam] Smoke: throttled" in subjects(m), timeout=60)
+        return f"arrived after backoff in {took:.1f}s"
+
+    async def subscription_removed() -> str:
+        before = {x["id"] for x in (await s.state())["subscriptions"]}
+        async with httpx.AsyncClient() as c:
+            await c.post(f"{mock}/mock/tenants/{tenants['Fabrikam']}", data={"action": "subscriptionRemoved"})
+        deadline = time.perf_counter() + 20
+        while time.perf_counter() < deadline:
+            after = {x["id"] for x in (await s.state())["subscriptions"]}
+            if len(after) == len(before) and after != before:
+                return "recreated"
+            await asyncio.sleep(0.3)
+        raise TimeoutError("subscription was not recreated")
+
+    async def revoke() -> str:
+        async with httpx.AsyncClient() as c:
+            await c.post(f"{mock}/mock/tenants/{tenants['Contoso']}", data={"action": "revoke"})
+        took = await s.wait_for(lambda m: not any(x.startswith("[Contoso]") for x in subjects(m)), timeout=30)
+        sources = (await alice.get(f"{web}/api/sources")).json()
+        status = {x["source_email"]: x["status"] for x in sources}
+        assert status["alice@contoso.example"] == "revoked", status
+        remaining = subjects(await s.mirrors())
+        assert "[Fabrikam] Contoso x Fabrikam partnership" in remaining, remaining
+        return f"Contoso mirrors removed in {took:.1f}s; shared meeting now labelled Fabrikam only"
+
+    async def unlink() -> str:
+        sources = (await alice.get(f"{web}/api/sources")).json()
+        fab = next(x for x in sources if x["source_email"] == "alice@fabrikam.example")
+        assert (await alice.delete(f"{web}/api/sources/{fab['id']}")).status_code == 202
+        took = await s.wait_for(lambda m: not m)
+        return f"all mirrors removed in {took:.1f}s"
+
+    async def health() -> str:
+        overview = (await operator.get(f"{web}/api/admin/overview")).json()
+        return (
+            f"tenants={overview['tenants']} sources={overview['sources']} errors_24h={overview['errors_24h']}"
+        )
+
+    await s.check("operator signs in", operator_signs_in)
+    await s.check("onboard Contoso (admin consent)", await onboard("Contoso"))
+    await s.check("onboard Fabrikam (admin consent)", await onboard("Fabrikam"))
+    await s.check("Alice signs in and links two tenants", alice_signs_in_and_links)
+    await s.check("initial backfill mirrored", backfill)
+    await s.check("created event is mirrored", create_event)
+    await s.check("updated event is mirrored", update_event)
+    await s.check("deleted event is removed", delete_event)
+    await s.check("missed notifications recovered", missed_notifications)
+    await s.check("throttled tenant recovers", throttled)
+    await s.check("removed subscription is recreated", subscription_removed)
+    await s.check("tenant revocation removes its mirrors", revoke)
+    await s.check("unlinking removes remaining mirrors", unlink)
+    await s.check("operator health overview", health)
+
+    await operator.aclose()
+    await alice.aclose()
+    print("OK" if not s.failures else f"{s.failures} check(s) failed")
+    return 1 if s.failures else 0
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--web", default="http://localhost:3000")
+    parser.add_argument("--mock", default="http://localhost:8001")
+    args = parser.parse_args()
+    sys.exit(asyncio.run(main(args.web, args.mock)))
