@@ -1,14 +1,15 @@
 """Webhook receiver contract, Graph client guards, tokens and session security."""
 
+import asyncio
 import uuid
 
 import pytest
 
-from app.graph.client import GraphNotFound, GraphThrottled, ReadOnlyViolation
-from app.graph.tokens import App, TokenError
+from app.graph.client import GraphForbidden, GraphNotFound, GraphThrottled, ReadOnlyViolation
+from app.graph.oidc import needs_admin_approval
+from app.graph.tokens import App, TokenError, is_reauth_error
 from app.security import (
     InvalidToken,
-    issue_consent_state,
     issue_oauth_state,
     issue_session,
     read_oauth_state,
@@ -31,7 +32,6 @@ async def test_validation_handshake_echoes_token(harness: Harness, path: str):
 
 
 async def _subscribed(h: Harness, operator, alice):
-    await h.onboard_tenant(operator, "contoso.example")
     await link_and_sync(h, alice, "alice@contoso.example")
     return next(iter(h.mock.subscriptions.values()))
 
@@ -119,6 +119,7 @@ async def test_lifecycle_requires_client_state(harness: Harness, operator, alice
 async def test_source_app_cannot_write(harness: Harness, operator, alice):
     await _subscribed(harness, operator, alice)
     tenant_id = tenant_of(harness.mock, "alice@contoso.example")
+    source = await harness.source("alice@contoso.example")
     graph = harness.services.graph
     for method in ("POST", "PATCH", "DELETE", "PUT"):
         with pytest.raises(ReadOnlyViolation):
@@ -128,11 +129,12 @@ async def test_source_app_cannot_write(harness: Harness, operator, alice):
                 app=App.SOURCE,
                 tenant_id=tenant_id,
                 scope=f"tenant:{tenant_id}",
+                source_id=source.id,
                 json={},
             )
     # Reads and subscription management are allowed.
     with pytest.raises(GraphNotFound):
-        await graph.source(tenant_id).delete_subscription(str(uuid.uuid4()))
+        await graph.source(source.id, tenant_id).delete_subscription(str(uuid.uuid4()))
 
 
 async def test_primary_app_only_in_home_tenant(harness: Harness):
@@ -141,46 +143,176 @@ async def test_primary_app_only_in_home_tenant(harness: Harness):
     assert await harness.services.tokens.get_token(App.PRIMARY, HOME_TENANT)
 
 
-async def test_tokens_cached_per_tenant(harness: Harness):
-    tokens = harness.services.tokens
+async def test_source_app_cannot_use_client_credentials(harness: Harness):
     contoso = tenant_of(harness.mock, "alice@contoso.example")
-    fabrikam = tenant_of(harness.mock, "alice@fabrikam.example")
-    for tid in (contoso, fabrikam):
-        harness.mock.tenants[tid].consented_apps.add(SOURCE_APP)
-    a1 = await tokens.get_token(App.SOURCE, contoso)
-    assert await tokens.get_token(App.SOURCE, contoso) == a1
-    assert await tokens.get_token(App.SOURCE, fabrikam) != a1
-    assert await harness.services.redis.ttl(f"token:source:{contoso}") > 3000
+    # Our token service never asks for app-only source tokens...
+    with pytest.raises(TokenError):
+        await harness.services.tokens.get_token(App.SOURCE, contoso)
+    # ...and the identity platform refuses them: the app has no application permissions.
+    async with harness.mock_client() as mock:
+        for tenant in (contoso, HOME_TENANT):
+            resp = await mock.post(
+                f"/{tenant}/oauth2/v2.0/token",
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": SOURCE_APP,
+                    "client_secret": "source-secret",
+                    "scope": "https://graph.microsoft.com/.default",
+                },
+            )
+            assert resp.status_code == 400
+            assert resp.json()["error"] == "unauthorized_client"
 
 
-async def test_unconsented_tenant_token_is_revocation(harness: Harness):
+async def test_source_tokens_cached_per_source(harness: Harness, alice):
+    h = harness
+    await link_and_sync(h, alice, "alice@contoso.example")
+    await link_and_sync(h, alice, "alice@fabrikam.example")
+    contoso = await h.source("alice@contoso.example")
+    fabrikam = await h.source("alice@fabrikam.example")
+    tokens = h.services.tokens
+    a1 = await tokens.get_source_token(contoso.id)
+    assert await tokens.get_source_token(contoso.id) == a1
+    assert await tokens.get_source_token(fabrikam.id) != a1
+    assert await h.services.redis.ttl(f"token:source:{contoso.id}") > 3000
+
+
+async def test_access_token_refreshes_and_rotation_is_persisted(harness: Harness, alice):
+    h = harness
+    await link_and_sync(h, alice, "alice@contoso.example")
+    source = await h.source("alice@contoso.example")
+    tokens = h.services.tokens
+    first_rt = source.refresh_token
+    await tokens.invalidate_source(source.id)
+
+    # Several workers need a token at once: one refresh, everyone gets its result. (The
+    # mock rotates strictly, so a second redemption of the same refresh token would fail.)
+    results = await asyncio.gather(*(tokens.get_source_token(source.id) for _ in range(5)))
+    assert len(set(results)) == 1
+    source = await h.source("alice@contoso.example")
+    assert source.refresh_token != first_rt
+    assert first_rt not in h.mock.refresh_tokens and source.refresh_token in h.mock.refresh_tokens
+    assert "Calendars.Read" in source.granted_scopes
+
+    # The refresh went to the source's own tenant endpoint, and the token reads Graph.
+    owner = h.mock.user_by_upn("alice@contoso.example")
+    claims = h.mock.verify(results[0])
+    assert claims["kind"] == "delegated" and claims["oid"] == owner.oid and "Calendars.Read" in claims["scp"]
+    graph = h.services.graph.source(source.id, owner.tenant_id)
+    assert (await graph.get_default_calendar(owner.oid))["id"] == owner.default_calendar_id
+
+    # A rejected (e.g. expired) access token is dropped and refreshed once, transparently.
+    await tokens.cache_source_token(source.id, "garbage", 3600)
+    assert (await graph.get_default_calendar(owner.oid))["id"] == owner.default_calendar_id
+    assert (await h.source("alice@contoso.example")).refresh_token != source.refresh_token
+
+
+@pytest.mark.parametrize("scenario,code", [("expired", "AADSTS700082"), ("revoked", "AADSTS700082")])
+async def test_dead_refresh_token_requires_reauth(harness: Harness, alice, scenario: str, code: str):
+    h = harness
+    await link_and_sync(h, alice, "alice@contoso.example")
+    source = await h.source("alice@contoso.example")
+    if scenario == "expired":
+        from datetime import timedelta
+
+        from mockgraph.state import now_utc
+
+        h.mock.refresh_tokens[source.refresh_token].expires_at = now_utc() - timedelta(seconds=1)
+    else:
+        h.mock.revoke_sessions(h.mock.user_by_upn("alice@contoso.example"))
+    await h.services.tokens.invalidate_source(source.id)
     with pytest.raises(TokenError) as info:
-        await harness.services.tokens.get_token(App.SOURCE, tenant_of(harness.mock, "alice@contoso.example"))
-    assert info.value.revoked and info.value.code == "AADSTS7000229"
+        await h.services.tokens.get_source_token(source.id)
+    assert info.value.reauth_required and info.value.code == code and info.value.source_id == source.id
+
+    # Through a job: the source is paused, not failed, and nothing is retried.
+    await h.services.queue.enqueue("sync_source", str(source.id), "scheduled")
+    assert await h.run_jobs() == [("sync_source", "reauth-required")]
+    assert (await h.source("alice@contoso.example")).status == "reauth_required"
+    assert h.queue.deferred == []
 
 
-async def test_throttle_is_per_tenant(harness: Harness):
-    contoso = tenant_of(harness.mock, "alice@contoso.example")
-    fabrikam = tenant_of(harness.mock, "alice@fabrikam.example")
-    for tid in (contoso, fabrikam):
-        harness.mock.tenants[tid].consented_apps.add(SOURCE_APP)
-    harness.mock.tenants[contoso].throttle_remaining = 1
+async def test_transient_token_failures_retry(harness: Harness, alice):
+    h = harness
+    await link_and_sync(h, alice, "alice@contoso.example")
+    source = await h.source("alice@contoso.example")
+    await h.services.tokens.invalidate_source(source.id)
+    login = h.router.routes.pop("login.test")  # identity platform unreachable
+    try:
+        await h.services.queue.enqueue("sync_source", str(source.id), "scheduled")
+        assert await h.run_jobs() == [("sync_source", "deferred")]
+    finally:
+        h.router.routes["login.test"] = login
+    assert (await h.source("alice@contoso.example")).status == "active"
+
+
+@pytest.mark.parametrize(
+    "error,code,expected",
+    [
+        ("invalid_grant", "AADSTS700082", True),
+        ("invalid_grant", None, True),
+        ("interaction_required", "AADSTS50076", True),
+        ("invalid_client", "AADSTS50079", True),
+        ("consent_required", None, True),
+        ("invalid_request", "AADSTS53003", True),
+        ("unauthorized_client", "AADSTS7000229", True),
+        ("invalid_client", "AADSTS7000215", False),  # our secret is wrong: operator problem
+        ("temporarily_unavailable", None, False),
+    ],
+)
+def test_reauth_classification(error, code, expected):
+    assert is_reauth_error(error, code) is expected
+
+
+@pytest.mark.parametrize(
+    "error,description,expected",
+    [
+        ("access_denied", "AADSTS90094: The grant requires admin permission.", True),
+        ("access_denied", "AADSTS90008: The user or administrator has not consented.", True),
+        ("invalid_client", "AADSTS65001: ... Need admin approval", True),
+        ("consent_required", None, True),
+        ("access_denied", "AADSTS65004: User declined to consent.", False),
+        ("access_denied", "AADSTS65001: The user has not consented", False),
+    ],
+)
+async def test_admin_approval_callback_mapping(harness: Harness, error, description, expected):
+    assert needs_admin_approval(error, description) is expected
+    params = {"error": error, **({"error_description": description} if description else {})}
+    async with harness.client() as client:
+        result = harness.result_of(await client.get("/auth/callback", params=params))
+    assert result["status"] == ("admin_approval_required" if expected else "error")
+    assert result["message"]
+
+
+async def test_throttle_is_per_tenant(harness: Harness, alice):
+    h = harness
+    await link_and_sync(h, alice, "alice@contoso.example")
+    await link_and_sync(h, alice, "alice@fabrikam.example")
+    contoso = await h.source("alice@contoso.example")
+    fabrikam = await h.source("alice@fabrikam.example")
+    contoso_tid = tenant_of(h.mock, "alice@contoso.example")
+    fabrikam_tid = tenant_of(h.mock, "alice@fabrikam.example")
+    h.mock.tenants[contoso_tid].throttle_remaining = 1
     with pytest.raises(GraphThrottled) as info:
-        await harness.services.graph.source(contoso).get_default_calendar("alice@contoso.example")
+        await h.services.graph.source(contoso.id, contoso_tid).get_default_calendar("alice@contoso.example")
     assert info.value.retry_after == 2
     # Still backing off (without calling Graph), while other tenants are unaffected.
     with pytest.raises(GraphThrottled):
-        await harness.services.graph.source(contoso).get_default_calendar("alice@contoso.example")
-    assert await harness.services.graph.source(fabrikam).get_default_calendar("alice@fabrikam.example")
+        await h.services.graph.source(contoso.id, contoso_tid).get_default_calendar("alice@contoso.example")
+    assert await h.services.graph.source(fabrikam.id, fabrikam_tid).get_default_calendar(
+        "alice@fabrikam.example"
+    )
 
 
-async def test_cross_tenant_mailbox_access_is_denied(harness: Harness):
-    from app.graph.client import GraphForbidden
-
-    contoso = tenant_of(harness.mock, "alice@contoso.example")
-    harness.mock.tenants[contoso].consented_apps.add(SOURCE_APP)
-    with pytest.raises(GraphForbidden):
-        await harness.services.graph.source(contoso).get_default_calendar("alice@fabrikam.example")
+async def test_delegated_token_only_reads_its_own_mailbox(harness: Harness, alice):
+    h = harness
+    await link_and_sync(h, alice, "alice@contoso.example")
+    source = await h.source("alice@contoso.example")
+    graph = h.services.graph.source(source.id, tenant_of(h.mock, "alice@contoso.example"))
+    assert await graph.get_default_calendar("alice@contoso.example")
+    for other in ("bob@contoso.example", "alice@fabrikam.example"):
+        with pytest.raises(GraphForbidden):
+            await graph.get_default_calendar(other)
 
 
 # --- sessions, state, CSRF -----------------------------------------------------------
@@ -197,8 +329,10 @@ def test_session_and_state_tokens_are_not_interchangeable():
         read_session(settings, state)
     with pytest.raises(InvalidToken):
         read_oauth_state(settings, session)
+    reauth = issue_oauth_state(settings, purpose="reauth", nonce="n", user_id=uid, source_id=uid)
+    assert read_oauth_state(settings, reauth)["sid"] == str(uid)
     with pytest.raises(InvalidToken):
-        read_session(settings, issue_consent_state(settings, uid))
+        read_session(settings, reauth)
     with pytest.raises(InvalidToken):
         read_session(make_settings(session_secret="another-secret-" + "y" * 40), session)
 
@@ -233,6 +367,7 @@ async def test_unauthenticated_requests(harness: Harness):
         assert (await client.get("/api/me")).status_code == 401
         assert (await client.get("/api/admin/overview")).status_code == 401
         assert (await client.get("/auth/link")).status_code == 401
+        assert (await client.get(f"/auth/reauth/{uuid.uuid4()}")).status_code == 401
 
 
 async def test_login_rejects_forged_state(harness: Harness):

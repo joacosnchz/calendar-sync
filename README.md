@@ -6,17 +6,23 @@ user's primary calendar in a tenant we operate. Source calendars are never writt
 
 This implements [`docs/PRD Unified Microsoft 365 Calendar.md`](docs/PRD%20Unified%20Microsoft%20365%20Calendar.md).
 
+Source calendars are read with **delegated** permissions. To link a calendar, a user signs in
+to their own tenant, approves read-only calendar access for themselves, and is redirected back.
+There is no tenant admin consent step. When a user's sign-in for a source expires or is
+revoked, that source pauses (its mirrors stay) and the user is asked to reconnect.
+
 ## Architecture
 
 ```
  customer tenants                     our platform (docker compose)                       our tenant
 ┌──────────────────┐  change/     ┌──────────────┐  enqueue  ┌─────────┐   ┌──────────────┐   ┌───────────────┐
 │ Microsoft Graph  │─ lifecycle ─▶│ api (FastAPI)│──────────▶│  redis  │──▶│ worker (arq) │──▶│ primary       │
-│ (Calendars.Read) │  webhooks    │ validate+202 │           │ (queue) │   │ fetch, delta,│   │ calendars     │
-└──────────────────┘              └──────┬───────┘           └────▲────┘   │ mirror, subs │   │ (ReadWrite    │
-         ▲  reads (app-only token per tenant)  │                  │        └──────┬───────┘   │  app, scoped) │
-         └─────────────────────────────────────┼──────────────────┼───────────────┘           └───────────────┘
-                                   ┌───────────▼──┐   ┌───────────┴───┐
+│ (Calendars.Read, │  webhooks    │ validate+202 │           │ (queue) │   │ fetch, delta,│   │ calendars     │
+│  delegated)      │              └──────┬───────┘           └────▲────┘   │ mirror, subs │   │ (ReadWrite    │
+└──────────────────┘                     │                        │        └──────┬───────┘   │  app, scoped) │
+         ▲  reads (each linked user's delegated token, refreshed per source)      │           └───────────────┘
+         └───────────────────────────────┼────────────────────────┼───────────────┘
+                                   ┌─────▼────────┐   ┌───────────┴───┐
   browser ──▶ web (Next.js) ──────▶│  postgres    │   │ scheduler     │  renew subscriptions, periodic
               /api, /auth proxied  └──────────────┘   │ (arq cron)    │  delta, mirror audit
                                                       └───────────────┘
@@ -26,8 +32,8 @@ This implements [`docs/PRD Unified Microsoft 365 Calendar.md`](docs/PRD%20Unifie
 | --- | --- |
 | `web` | Next.js 16 app: sign-in, linked accounts with sync health, unified week view, operator console. Proxies `/api/*` and `/auth/*` to the API so cookies are first-party. |
 | `api` | FastAPI. Webhook + lifecycle receivers (validate `clientState`, enqueue, return 202), OAuth flows, REST API. Never calls Graph while handling a notification. |
-| `redis` | The queue (arq). AOF-persisted so queued jobs survive restarts. Also holds the per-tenant token cache, throttle back-off and job coalescing keys. |
-| `worker` | Fetch-on-notify, `calendarView` delta sync, mirror writes, subscription create/renew/reauthorize, unlink/revocation clean-up. Scale with `--scale worker=N`. |
+| `redis` | The queue (arq). AOF-persisted so queued jobs survive restarts. Also holds the per-source delegated access-token cache (refresh locks included), throttle back-off and job coalescing keys. |
+| `worker` | Fetch-on-notify, `calendarView` delta sync, mirror writes, subscription create/renew/reauthorize, unlink clean-up, pausing sources that need reauthentication. Scale with `--scale worker=N`. |
 | `scheduler` | Cron sweeps that only enqueue work: renewals (every 15 min, renew after 24 h), safety-net delta (every 6 h), mirror audit, stuck provisioning. |
 | `db` | Postgres 17. Schema managed by Alembic (`migrate` runs on start). |
 | `mockgraph` | **Dev only** (`COMPOSE_PROFILES=mock`): a stand-in for `login.microsoftonline.com` + Graph with a control panel, so the whole system runs without real tenants. |
@@ -38,7 +44,7 @@ This implements [`docs/PRD Unified Microsoft 365 Calendar.md`](docs/PRD%20Unifie
    subscription's `clientState` (encrypted at rest, constant-time compare) and tenant,
    enqueues `process_notification` and returns 202. Duplicate notifications for an event
    that is still queued collapse into one job.
-2. A worker fetches the event with the tenant's app-only token (fetch-on-notify), stores
+2. A worker fetches the event with that source's delegated token (fetch-on-notify), stores
    only the fields mirrors need (subject and location encrypted), and only if Graph's
    `lastModifiedDateTime` is newer, so repeated or out-of-order notifications do nothing.
 3. A `reconcile_group` job brings the user's primary calendar in line with every copy of
@@ -51,8 +57,17 @@ when Graph says they're gone; `missed` / `subscriptionRemoved` trigger a delta r
 6-hourly delta (re-baselined daily so the 90-day-back / 365-day-ahead window keeps
 rolling) treats delta as the source of truth; Graph 429/503 set a per-tenant (reads) or
 per-mailbox (writes) back-off in Redis honouring `Retry-After`, so one busy tenant never
-slows the others. Specific AADSTS errors (Enterprise app deleted, consent missing) mark
-the tenant revoked and remove its mirrors; transient errors are retried.
+slows the others.
+
+Delegated tokens: the link callback stores the source's refresh token (encrypted). Workers
+redeem it at the source tenant's token endpoint, cache the access token per source in Redis,
+persist rotated refresh tokens, and serialise refreshes per source with a Redis lock. When
+a refresh fails with an error that needs the user (`invalid_grant`, `interaction_required`,
+`consent_required`, AADSTS 70008 / 700082 / 50173 / 50076 / 65001 / …), or Graph keeps
+returning 401/403, the source moves to `reauth_required`. Sync pauses, its mirrors are kept,
+and the dashboard shows a **Reconnect** button (`/auth/reauth/{id}`, account pre-filled).
+After the user signs in again as the same account, the subscription is recreated and a delta
+resync catches up. Network errors, 5xx and 429 are retried.
 
 ## Quick start (local, against the mock)
 
@@ -66,37 +81,45 @@ docker compose up -d --build
 | URL | |
 | --- | --- |
 | http://localhost:3000 | the app |
-| http://localhost:8001 | mock Microsoft 365 control panel (create/move/cancel events, revoke consent, throttle a tenant, drop notifications, send lifecycle events) |
+| http://localhost:8001 | mock Microsoft 365 control panel (create/move/cancel events, revoke a user's sign-in or consent, block user consent for a tenant, throttle a tenant, drop notifications, send lifecycle events) |
 | http://localhost:8000/docs | API docs; `/metrics` for Prometheus (worker metrics on `:9100` inside the network) |
 
 Walkthrough:
 
-1. Sign in as **ops@calsync.example** (an operator via `OPERATOR_EMAILS`). Under
-   **Operations → Tenants**, create "Contoso" and open the consent link, then accept as
-   Contoso's admin.
-2. Sign in as **alice@contoso.example**. Her unified calendar is provisioned
-   automatically. **Link an account** → `alice@contoso.example`: existing events are
-   backfilled. Link `alice@fabrikam.example` too: Fabrikam hasn't consented, so the page
-   gives her a link to forward to that admin. Once it's approved, syncing starts on its own.
-3. In the mock control panel, create or move an event in a source mailbox and watch it
+1. Sign in as **alice@contoso.example**. Her unified calendar is provisioned
+   automatically. **Link an account** → `alice@contoso.example`: she approves read-only
+   calendar access herself and existing events are backfilled. Link
+   `alice@fabrikam.example` too. No admin step is needed for either tenant; both show up
+   under **Operations → Tenants** (sign in as **ops@calsync.example**, an operator via
+   `OPERATOR_EMAILS`).
+2. In the mock control panel, create or move an event in a source mailbox and watch it
    appear in **Calendar** (and in the host tenant's shared mailbox in the panel) in about a
    second. The "Contoso x Fabrikam partnership" meeting is in both of Alice's calendars and
    is mirrored once.
+3. In the panel, click **Revoke refresh tokens** for `alice@fabrikam.example`. Graph sends
+   `reauthorizationRequired`, the refresh fails, and within seconds the source shows
+   **sign-in needed** and the dashboard asks her to reconnect; her Fabrikam mirrors stay.
+   **Reconnect** signs her in again and sync catches up.
+4. Use **Toggle blocking user consent** on a tenant, then link an account from it that
+   hasn't consented yet: the result page tells the user their IT admin must approve the app.
 
 Mock state persists in a volume; `make reset` (`docker compose down -v && up`) starts over.
 
 ## Tests
 
 ```bash
-make test           # backend suite (68 tests) in the backend image + frontend typecheck/lint
+make test           # backend suite (94 tests) in the backend image + frontend typecheck/lint
 make e2e            # 14 live checks against a fresh running stack (after `make reset`)
 ```
 
 The backend suite runs in-process: the real FastAPI app and worker job functions,
 real Postgres and Redis, and the mock Graph wired together over ASGI transports. It covers
-onboarding, consent and denial, backfill, create/update/cancel/delete, duplicate and
-stale notifications, cross-source de-duplication, unlink, tenant revocation and
-re-consent, `missed` / `subscriptionRemoved` / `reauthorizationRequired`, renewal and
+self-service linking without admin consent, refresh-token storage and rotation, expired
+or revoked refresh tokens pausing a source (mirrors kept), reconnecting with the wrong and
+the right account, tenants that block user consent, the source app being refused
+client credentials, backfill, create/update/cancel/delete, duplicate and
+stale notifications, cross-source de-duplication, unlink,
+`missed` / `subscriptionRemoved` / `reauthorizationRequired`, renewal and
 recreation, expired delta tokens, pagination, per-tenant throttling, time zones, privacy
 mode, user isolation, account deletion, the read-only guard (FR-11) and "no attendees on
 mirrors" (FR-9).
@@ -113,12 +136,17 @@ docker compose run --rm --no-deps \
 ## Running against real Microsoft 365
 
 1. **Source app** (in our home tenant): *Accounts in any organizational directory*.
-   API permissions: `Calendars.Read` (**Application**) plus delegated `openid`, `profile`,
-   `email`, `User.Read`. Redirect URIs (Web): `{PUBLIC_WEB_URL}/auth/callback` and
-   `{PUBLIC_WEB_URL}/auth/adminconsent/callback`. Add a certificate (preferred) or a secret.
-   Complete publisher verification.
-2. **Primary app** (single tenant): `Calendars.ReadWrite` (**Application**), admin consent
-   in our tenant, then restrict it to the primary-calendar mailboxes:
+   API permissions, all **Delegated**: `openid`, `profile`, `email`, `offline_access`,
+   `User.Read`, `Calendars.Read`. None need admin consent and there are no application
+   permissions; don't click "Grant admin consent" for customer tenants. Redirect URI (Web):
+   `{PUBLIC_WEB_URL}/auth/callback` (used for sign-in, linking and reconnecting). Add a
+   certificate (preferred) or a secret. Complete publisher verification: tenants on
+   Microsoft's recommended consent setting only let users consent to verified publishers.
+   Tenants that disable user consent need their admin to approve the app (users are told
+   so); the platform itself never asks for admin consent.
+2. **Primary app** (single tenant, our tenant only): `Calendars.ReadWrite` (**Application**),
+   granted once by our own admin. It stays app-only because users have no identity in our
+   tenant to delegate from. Restrict it to the primary-calendar mailboxes:
    ```powershell
    New-ApplicationAccessPolicy -AppId <primary-app-id> -PolicyScopeGroupId calendars@yourtenant.com `
      -AccessRight RestrictAccess -Description "Calendar Sync primary calendars"
@@ -138,9 +166,9 @@ docker compose run --rm --no-deps \
 
 | Req | Where |
 | --- | --- |
-| FR-1 admin consent link per customer | Operations → Tenants; `api/admin.py`, `api/auth.py::admin_consent_callback` |
+| FR-1 tenant registered on first link, no admin consent | `api/auth.py::_complete_link` |
 | FR-2 one primary calendar per user | `sync/lifecycle.py::provision_primary` (both hosting models) |
-| FR-3 link only mailboxes you sign in to | `api/auth.py::_complete_link` (OIDC `tid` + `oid`, nonce + browser-bound state) |
+| FR-3 delegated sign-in proves ownership | `api/auth.py::_complete_link` (OIDC `tid` + `oid`, nonce + browser-bound state; refresh token stored encrypted) |
 | FR-4 subscription per source calendar | `sync/subscriptions.py::create_subscription` |
 | FR-5 webhook + fetch-on-notify | `api/webhooks.py`, `sync/source_sync.py::process_notification` |
 | FR-6 renew before expiry | `worker/sweeps.py::renew_sweep`, `subscriptions.renew_subscription` |
@@ -149,9 +177,12 @@ docker compose run --rm --no-deps \
 | FR-9 no attendees | `build_mirror_payload`; tested |
 | FR-10 keep show-as | `build_mirror_payload` (busiest status wins across duplicates) |
 | FR-11 never write to sources | `GraphClient` refuses non-GET source calls except `/subscriptions`; tested |
-| FR-12 remove mirrors on unlink / revoke | `lifecycle.purge_source`, `revoke_tenant` |
+| FR-12 remove mirrors on unlink | `lifecycle.purge_source` |
 | FR-13 per-user and per-tenant health | Accounts page, Operations console, Prometheus metrics labelled by tenant |
 | FR-14 same meeting in two sources mirrored once | groups by `iCalUId` (`dedup_key`) |
+| FR-15 pause and ask to reconnect on expired/revoked sign-in | `graph/tokens.py` (classification), `lifecycle.mark_reauth_required`, dashboard banner |
+| FR-16 reconnect resumes with delta resync | `api/auth.py` (`/auth/reauth/{id}`, same `tid`/`oid` enforced), `setup_source` recovery mode |
+| FR-17 "ask your IT admin" when user consent is blocked | `api/auth.py` callback → `/link/result?status=admin_approval_required` |
 
 ## Decisions on the PRD's open questions
 
@@ -176,8 +207,15 @@ docker compose run --rm --no-deps \
 - The mock only simulates single-instance events. Recurring series are handled in code
   (occurrences come from `calendarView`, series-master changes trigger a delta) but only
   exercised by unit-level logic, not by the mock.
-- Deleting data after unlink, revocation or account deletion is immediate rather than
-  after a configurable retention window.
+- Deleting data after unlink or account deletion is immediate rather than after a
+  configurable retention window. Sources paused for reauthentication keep their mirrors
+  indefinitely (PRD open question).
+- Users are only prompted to reconnect in the app; there are no email reminders yet.
+- Existing deployments: migration `0002_delegated_auth` has no refresh tokens to carry over,
+  so every existing linked source becomes `reauth_required` and each user must reconnect once.
+  Drain the queue before deploying: old `revoke_tenant` / `activate_tenant` jobs no longer exist.
+- Real Entra error codes for blocked consent and revoked grants are classified from
+  Microsoft's documentation and tested against the mock only.
 - The audit log is in Postgres, with no export.
 
 ## Repository layout
@@ -185,9 +223,9 @@ docker compose run --rm --no-deps \
 ```
 backend/
   app/api/          FastAPI routers (webhooks, auth, user API, operator API)
-  app/graph/        token service, Graph client (throttling, read-only guard), OIDC
+  app/graph/        token service (delegated per source + app-only primary), Graph client, OIDC
   app/sync/         normalisation, delta, notifications, mirroring, subscriptions, lifecycle
-  app/worker/       arq job wrappers (retry/throttle/revocation), cron sweeps, settings
+  app/worker/       arq job wrappers (retry/throttle/reauth), cron sweeps, settings
   alembic/          migrations
   mockgraph/        local Microsoft identity + Graph stand-in (dev/test only)
   scripts/          e2e smoke test

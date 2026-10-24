@@ -3,7 +3,7 @@
 import { useState } from "react";
 
 import { AppShell } from "@/components/AppShell";
-import { Badge, Button, Card, CopyButton, cx, ErrorNote, Spinner, Stat, StatusBadge } from "@/components/ui";
+import { Badge, Button, Card, cx, ErrorNote, Spinner, Stat, StatusBadge } from "@/components/ui";
 import {
   patch,
   post,
@@ -35,12 +35,16 @@ function Admin({ me }: { me: Me }) {
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-semibold text-slate-900">Operations</h1>
-        <p className="mt-1 text-sm text-slate-600">Onboard tenants, provision primary calendars and watch sync health.</p>
+        <p className="mt-1 text-sm text-slate-600">Provision primary calendars, set tenant privacy and watch sync health.</p>
       </div>
 
       <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
-        <Stat label="Connected tenants" value={o ? (o.tenants.connected ?? 0) : "–"} hint={`${sum(o?.tenants)} total`} />
-        <Stat label="Active sources" value={o ? (o.sources.active ?? 0) : "–"} hint={`${o?.users ?? "–"} users`} />
+        <Stat label="Tenants" value={o?.tenants ?? "–"} hint={`${o?.users ?? "–"} users`} />
+        <Stat
+          label="Active sources"
+          value={o ? (o.sources.active ?? 0) : "–"}
+          hint={o ? `${o.sources.reauth_required ?? 0} need sign-in · ${sum(o.sources)} total` : undefined}
+        />
         <Stat
           label="Subscriptions"
           value={o?.subscriptions ?? "–"}
@@ -104,111 +108,60 @@ function Td({ children, className, title }: { children?: React.ReactNode; classN
 
 function Tenants({ onChange }: { onChange: () => Promise<void> }) {
   const tenants = useResource<Tenant[]>("/api/admin/tenants", 10_000);
-  const [form, setForm] = useState({ display_name: "", domain: "" });
-  const [created, setCreated] = useState<Tenant>();
   const [error, setError] = useState<string>();
-
-  async function refresh() {
-    await Promise.all([tenants.reload(), onChange()]);
-  }
 
   async function act(action: () => Promise<unknown>) {
     setError(undefined);
     try {
       await action();
-      await refresh();
+      await Promise.all([tenants.reload(), onChange()]);
     } catch (err) {
       setError((err as Error).message);
     }
   }
 
   return (
-    <div className="space-y-5">
-      <Card className="p-5">
-        <div className="font-medium text-slate-900">Onboard a customer tenant</div>
-        <p className="mt-1 text-sm text-slate-600">
-          Generates an admin consent link for <b>Calendars.Read</b> (application). Send it to the customer&apos;s
-          Global Administrator; the tenant connects as soon as they approve.
-        </p>
-        <form
-          className="mt-4 flex flex-wrap items-end gap-3"
-          onSubmit={(e) => {
-            e.preventDefault();
-            void act(async () => {
-              const tenant = await post<Tenant>("/api/admin/tenants", {
-                display_name: form.display_name,
-                domain: form.domain || null,
-              });
-              setCreated(tenant);
-              setForm({ display_name: "", domain: "" });
-            });
-          }}
-        >
-          <label className="text-sm">
-            <span className="text-slate-600">Customer name</span>
-            <input
-              required
-              value={form.display_name}
-              onChange={(e) => setForm({ ...form, display_name: e.target.value })}
-              className="mt-1 block w-56 rounded-md border border-slate-300 px-2.5 py-1.5"
-              placeholder="Contoso"
-            />
-          </label>
-          <label className="text-sm">
-            <span className="text-slate-600">Domain or tenant ID (optional)</span>
-            <input
-              value={form.domain}
-              onChange={(e) => setForm({ ...form, domain: e.target.value })}
-              className="mt-1 block w-64 rounded-md border border-slate-300 px-2.5 py-1.5"
-              placeholder="contoso.com"
-            />
-          </label>
-          <Button variant="primary">Create consent link</Button>
-        </form>
-        {created?.consent_url && (
-          <div className="mt-4 rounded-lg bg-brand-50 p-3 text-sm">
-            <div className="font-medium text-brand-700">Consent link for {created.display_name}</div>
-            <div className="mt-2 flex items-center gap-2">
-              <code className="min-w-0 flex-1 truncate rounded bg-white px-2 py-1 text-xs">{created.consent_url}</code>
-              <CopyButton value={created.consent_url} />
-              <a className="text-xs font-medium text-brand-700 underline" href={created.consent_url} target="_blank" rel="noreferrer">
-                Open
-              </a>
-            </div>
-          </div>
-        )}
-      </Card>
-
+    <div className="space-y-4">
+      <p className="text-sm text-slate-600">
+        Tenants appear here the first time someone links a calendar from them. Each user approves read-only{" "}
+        <b>Calendars.Read</b> (delegated) access for themselves; organizations that block user consent must approve
+        Calendar Sync in their own tenant.
+      </p>
       <ErrorNote error={error ?? tenants.error} />
       {!tenants.data ? (
         <Spinner />
+      ) : tenants.data.length === 0 ? (
+        <Card className="p-8 text-center text-sm text-slate-500">No tenants yet. They appear once a user links a calendar.</Card>
       ) : (
-        <Table head={["Tenant", "Status", "Sources", "Last notification", "Next expiry", "Errors 24h", ""]}>
+        <Table head={["Tenant", "Sources", "Last notification", "Next expiry", "Errors 24h", ""]}>
           {tenants.data.map((t) => (
             <tr key={t.id}>
               <Td>
                 <div className="font-medium text-slate-900">{t.display_name}</div>
-                <div className="font-mono text-xs text-slate-500">{t.tenant_id ?? t.domain ?? "tenant unknown until consent"}</div>
+                <div className="font-mono text-xs text-slate-500">{t.tenant_id ?? t.domain ?? "—"}</div>
                 {!t.copy_details && (
                   <div className="mt-1">
                     <Badge tone="info">privacy: busy only</Badge>
                   </div>
                 )}
-              </Td>
-              <Td>
-                <StatusBadge status={t.consent_status} />
                 {t.last_error && <div className="mt-1 max-w-56 text-xs text-rose-700">{t.last_error}</div>}
               </Td>
-              <Td className="tabular-nums">
-                {t.active_source_count} / {t.source_count}
+              <Td>
+                <div className="tabular-nums">
+                  {t.active_source_count} / {t.source_count} active
+                </div>
+                {t.reauth_required_count > 0 && (
+                  <div className="mt-1">
+                    <Badge tone="warn">{t.reauth_required_count} sign-in needed</Badge>
+                  </div>
+                )}
               </Td>
               <Td title={dateTime(t.last_notification_at)}>{relativeTime(t.last_notification_at)}</Td>
               <Td title={dateTime(t.next_subscription_expiry)}>
                 {t.next_subscription_expiry ? relativeTime(t.next_subscription_expiry) : "—"}
               </Td>
               <Td>{t.errors_24h ? <Badge tone="bad">{t.errors_24h}</Badge> : <span className="text-slate-400">0</span>}</Td>
-              <Td className="space-x-1.5 whitespace-nowrap text-right">
-                {t.consent_url && <CopyButton value={t.consent_url} label="Consent link" />}
+              <Td className="whitespace-nowrap text-right">
                 <Button
                   size="sm"
                   onClick={() => act(() => patch(`/api/admin/tenants/${t.id}`, { copy_details: !t.copy_details }))}
@@ -216,19 +169,6 @@ function Tenants({ onChange }: { onChange: () => Promise<void> }) {
                 >
                   {t.copy_details ? "Hide details" : "Show details"}
                 </Button>
-                {t.consent_status === "connected" && (
-                  <Button
-                    size="sm"
-                    variant="danger"
-                    onClick={() => {
-                      if (confirm(`Disconnect ${t.display_name}? All mirrored events from it will be removed.`)) {
-                        void act(() => post(`/api/admin/tenants/${t.id}/revoke`));
-                      }
-                    }}
-                  >
-                    Disconnect
-                  </Button>
-                )}
               </Td>
             </tr>
           ))}

@@ -1,7 +1,5 @@
 "use client";
 
-import { useState } from "react";
-
 export function cx(...classes: (string | false | null | undefined)[]) {
   return classes.filter(Boolean).join(" ");
 }
@@ -31,21 +29,22 @@ export function Badge({ tone = "neutral", children }: { tone?: Tone; children: R
 
 const STATUS_TONES: Record<string, Tone> = {
   active: "good",
-  connected: "good",
   ready: "good",
-  pending_consent: "warn",
-  pending: "warn",
+  reauth_required: "warn",
   provisioning: "info",
   unassigned: "warn",
   removing: "neutral",
-  revoked: "bad",
-  denied: "bad",
   error: "bad",
   renew_failed: "bad",
 };
 
+// Statuses whose raw name doesn't read well; the rest just lose their underscores.
+const STATUS_LABELS: Record<string, string> = {
+  reauth_required: "sign-in needed",
+};
+
 export function StatusBadge({ status }: { status: string }) {
-  return <Badge tone={STATUS_TONES[status] ?? "neutral"}>{status.replace(/_/g, " ")}</Badge>;
+  return <Badge tone={STATUS_TONES[status] ?? "neutral"}>{STATUS_LABELS[status] ?? status.replace(/_/g, " ")}</Badge>;
 }
 
 export function Card({ className, children }: { className?: string; children: React.ReactNode }) {
@@ -100,23 +99,6 @@ export function LinkButton({
     >
       {children}
     </a>
-  );
-}
-
-export function CopyButton({ value, label = "Copy" }: { value: string; label?: string }) {
-  const [copied, setCopied] = useState(false);
-  return (
-    <Button
-      size="sm"
-      type="button"
-      onClick={async () => {
-        await navigator.clipboard.writeText(value);
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
-      }}
-    >
-      {copied ? "Copied" : label}
-    </Button>
   );
 }
 

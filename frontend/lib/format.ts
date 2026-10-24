@@ -23,6 +23,11 @@ export function dateTime(iso: string | null | undefined): string {
   return new Date(iso).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
 
+/** "1 calendar needs" / "3 calendars need" you to sign in again. */
+export function reauthSummary(count: number): string {
+  return count === 1 ? "1 calendar needs you to sign in again" : `${count} calendars need you to sign in again`;
+}
+
 export function timeOfDay(date: Date): string {
   return date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
 }

@@ -12,10 +12,9 @@ from sqlalchemy.orm import selectinload
 from app.api import schemas
 from app.api.deps import csrf_protect, current_user, get_services, get_session
 from app.audit import audit
-from app.graph.oidc import admin_consent_url
 from app.models import LinkedSource, MirrorMapping, SourceEvent, SourceStatus, Tenant, User
 from app.queue import sync_key
-from app.security import SESSION_COOKIE, issue_consent_state
+from app.security import SESSION_COOKIE
 from app.services import Services
 from app.sync.mirror import SHOW_AS_RANK
 from app.sync.source_sync import SyncMode, enqueue_reconciles
@@ -23,15 +22,7 @@ from app.sync.source_sync import SyncMode, enqueue_reconciles
 router = APIRouter(prefix="/api", tags=["me"], dependencies=[Depends(csrf_protect)])
 
 
-def consent_link(services: Services, tenant: Tenant) -> str:
-    return admin_consent_url(
-        services.settings,
-        tenant=tenant.tenant_id or tenant.domain or "organizations",
-        state=issue_consent_state(services.settings, tenant.id),
-    )
-
-
-def source_out(services: Services, source: LinkedSource, event_count: int) -> schemas.SourceOut:
+def source_out(source: LinkedSource, event_count: int) -> schemas.SourceOut:
     sub = source.subscription
     return schemas.SourceOut(
         id=source.id,
@@ -42,7 +33,6 @@ def source_out(services: Services, source: LinkedSource, event_count: int) -> sc
             id=source.tenant.id,
             display_name=source.tenant.display_name,
             tenant_id=source.tenant.tenant_id,
-            consent_status=source.tenant.consent_status,
         ),
         last_synced_at=source.last_synced_at,
         last_full_sync_at=source.last_full_sync_at,
@@ -51,9 +41,8 @@ def source_out(services: Services, source: LinkedSource, event_count: int) -> sc
         last_error_at=source.last_error_at,
         subscription=schemas.SubscriptionHealth.model_validate(sub, from_attributes=True) if sub else None,
         event_count=event_count,
-        consent_url=consent_link(services, source.tenant)
-        if source.status == SourceStatus.PENDING_CONSENT
-        else None,
+        reauth_url=f"/auth/reauth/{source.id}" if source.status == SourceStatus.REAUTH_REQUIRED else None,
+        reauth_required_at=source.reauth_required_at,
         created_at=source.created_at,
     )
 
@@ -123,7 +112,7 @@ async def list_sources(
             )
         ).all()
     )
-    return [source_out(services, s, counts.get(s.id, 0)) for s in sources]
+    return [source_out(s, counts.get(s.id, 0)) for s in sources]
 
 
 @router.patch("/sources/{source_id}", response_model=schemas.SourceOut)
@@ -144,7 +133,7 @@ async def update_source(
     if changed:
         # Labels appear on mirrors, so re-render them.
         await enqueue_reconciles(services, user.id, keys)
-    return source_out(services, source, len(keys))
+    return source_out(source, len(keys))
 
 
 @router.delete("/sources/{source_id}", status_code=202)
@@ -197,7 +186,7 @@ async def unified_calendar(
             .join(Tenant, Tenant.id == LinkedSource.tenant_pk)
             .where(
                 LinkedSource.user_id == user.id,
-                LinkedSource.status == SourceStatus.ACTIVE,
+                LinkedSource.status.in_(SourceStatus.MIRRORED),
                 SourceEvent.start_utc < end,
                 SourceEvent.end_utc > start,
             )

@@ -85,22 +85,33 @@ def create_mock_app(state: MockState | None = None, *, seed_demo: bool = True) -
     async def authorize(request: Request, tenant: str) -> str:
         s = st(request)
         q = dict(request.query_params)
+        if tenant not in ("organizations", "common") and s.find_tenant(tenant) is None:
+            return _page("Sign in", f"<p>AADSTS90002: Tenant '{html.escape(tenant)}' not found.</p>")
         tenants = [
             t
             for t in s.tenants.values()
             if tenant in ("organizations", "common") or s.find_tenant(tenant) is t
         ]
-        rows = []
-        for t in tenants:
-            for u in t.users.values():
-                if u.upn == s.shared_mailbox:
-                    continue
-                link = "/mock/authorize/complete?" + urlencode({**q, "oid": u.oid})
-                rows.append(
-                    f"<a class='account' href='{html.escape(link)}'><b>{html.escape(u.display_name)}</b>"
-                    f"<span>{html.escape(u.upn)}</span><small>{html.escape(t.name)}</small></a>"
-                )
-        return _page("Pick an account", "<p class='muted'>Mock Microsoft sign-in</p>" + "".join(rows))
+        hint = (q.get("login_hint") or "").lower()
+        accounts = [(t, u) for t in tenants for u in t.users.values() if u.upn != s.shared_mailbox]
+        # login_hint: offer that account first, the rest under "Use another account".
+        hinted = [(t, u) for t, u in accounts if u.upn == hint]
+        others = [(t, u) for t, u in accounts if u.upn != hint]
+
+        def row(t, u) -> str:
+            link = "/mock/authorize/complete?" + urlencode({**q, "oid": u.oid, "tenant_path": tenant})
+            return (
+                f"<a class='account' href='{html.escape(link)}'><b>{html.escape(u.display_name)}</b>"
+                f"<span>{html.escape(u.upn)}</span><small>{html.escape(t.name)}</small></a>"
+            )
+
+        scopes = html.escape(q.get("scope", ""))
+        body = f"<p class='muted'>Mock Microsoft sign-in · requesting <code>{scopes}</code></p>"
+        body += "".join(row(t, u) for t, u in hinted)
+        if hinted and others:
+            body += "<p class='muted'>Use another account</p>"
+        body += "".join(row(t, u) for t, u in others)
+        return _page("Pick an account", body)
 
     @app.get("/mock/authorize/complete")
     async def authorize_complete(request: Request) -> Response:
@@ -109,36 +120,76 @@ def create_mock_app(state: MockState | None = None, *, seed_demo: bool = True) -
         user = s.find_user(q["oid"])
         if user is None:
             raise MockGraphError(400, "invalid_request", "Unknown user")
+        redirect_uri, state = q["redirect_uri"], q.get("state", "")
+        tenant_path = q.get("tenant_path", "organizations")
+        if tenant_path not in ("organizations", "common"):
+            authority = s.find_tenant(tenant_path)
+            if authority is None or authority.tenant_id != user.tenant_id:
+                params = {
+                    "error": "invalid_request",
+                    "error_description": f"AADSTS50020: User account '{user.upn}' does not exist in "
+                    f"tenant '{tenant_path}'.",
+                    "state": state,
+                }
+                return RedirectResponse(f"{redirect_uri}?{urlencode(params)}", status_code=302)
+        scopes = q.get("scope", "").split()
+        needed = s.consent_needed(user, q["client_id"], scopes)
+        if needed and s.tenants[user.tenant_id].user_consent_blocked:
+            params = {
+                "error": "access_denied",
+                "error_description": "AADSTS90094: The grant requires admin permission. "
+                f"{s.tenants[user.tenant_id].name} doesn't allow users to consent to "
+                f"{' '.join(sorted(needed))}; an administrator must approve this app (admin approval "
+                "required).",
+                "state": state,
+            }
+            return RedirectResponse(f"{redirect_uri}?{urlencode(params)}", status_code=302)
+        # The user consents for themselves (incremental consent for the new scopes).
+        s.grant(user, q["client_id"], scopes)
         code = secrets.token_urlsafe(24)
         s.codes[code] = {
             "oid": user.oid,
             "nonce": q.get("nonce"),
             "client_id": q["client_id"],
-            "redirect_uri": q["redirect_uri"],
+            "redirect_uri": redirect_uri,
+            "scopes": scopes,
         }
-        params = {"code": code, "state": q.get("state", ""), "session_state": secrets.token_hex(8)}
-        return RedirectResponse(f"{q['redirect_uri']}?{urlencode(params)}", status_code=302)
+        params = {"code": code, "state": state, "session_state": secrets.token_hex(8)}
+        return RedirectResponse(f"{redirect_uri}?{urlencode(params)}", status_code=302)
 
     @app.post("/{tenant}/oauth2/v2.0/token")
     async def token(request: Request, tenant: str) -> JSONResponse:
         s = st(request)
-        form = dict(await request.form())
+        form = {k: str(v) for k, v in (await request.form()).items()}
+        client_id, secret = form.get("client_id", ""), form.get("client_secret")
         try:
-            if form.get("grant_type") == "client_credentials":
+            grant_type = form.get("grant_type")
+            if grant_type == "client_credentials":
+                return JSONResponse(s.issue_app_token(tenant, client_id, secret))
+            if grant_type == "refresh_token":
                 return JSONResponse(
-                    s.issue_app_token(tenant, form.get("client_id", ""), form.get("client_secret"))
+                    s.redeem_refresh_token(
+                        tenant, client_id, secret, form.get("refresh_token", ""), form.get("scope", "")
+                    )
                 )
-            if form.get("grant_type") == "authorization_code":
+            if grant_type == "authorization_code":
+                s._check_client(client_id, secret)
                 grant = s.codes.pop(form.get("code", ""), None)
                 if (
                     grant is None
-                    or grant["client_id"] != form.get("client_id")
+                    or grant["client_id"] != client_id
                     or grant["redirect_uri"] != form.get("redirect_uri")
                 ):
                     raise MockGraphError(
                         400, "invalid_grant", "AADSTS70000: The provided authorization code is invalid."
                     )
                 user = s.users[grant["oid"]]
+                if tenant not in ("organizations", "common") and s.find_tenant(tenant) is not s.tenants.get(
+                    user.tenant_id
+                ):
+                    raise MockGraphError(
+                        400, "invalid_grant", "AADSTS50020: The code was issued for a different tenant."
+                    )
                 claims = {
                     "ver": "2.0",
                     "aud": grant["client_id"],
@@ -151,22 +202,9 @@ def create_mock_app(state: MockState | None = None, *, seed_demo: bool = True) -
                     "name": user.display_name,
                     "nonce": grant["nonce"],
                 }
-                return JSONResponse(
-                    {
-                        "token_type": "Bearer",
-                        "scope": form.get("scope", ""),
-                        "expires_in": 3599,
-                        "id_token": s.sign(claims),
-                        "access_token": s.sign(
-                            {
-                                "kind": "delegated",
-                                "tid": user.tenant_id,
-                                "oid": user.oid,
-                                "appid": grant["client_id"],
-                            }
-                        ),
-                    }
-                )
+                body = s.delegated_tokens(user, client_id, grant["scopes"])
+                body["id_token"] = s.sign(claims)
+                return JSONResponse(body)
             raise MockGraphError(400, "unsupported_grant_type", "AADSTS70003: unsupported grant type")
         except MockGraphError as exc:
             code = exc.message.split(":")[0].removeprefix("AADSTS")
@@ -178,61 +216,6 @@ def create_mock_app(state: MockState | None = None, *, seed_demo: bool = True) -
                 },
                 status_code=exc.status,
             )
-
-    @app.get("/{tenant}/adminconsent", response_class=HTMLResponse)
-    async def admin_consent(request: Request, tenant: str) -> str:
-        s = st(request)
-        q = dict(request.query_params)
-        candidates = (
-            [t for t in s.tenants.values() if not t.is_home]
-            if tenant in ("organizations", "common")
-            else [t for t in [s.find_tenant(tenant)] if t]
-        )
-        if not candidates:
-            return _page("Admin consent", f"<p>Unknown tenant {html.escape(tenant)}</p>")
-        forms = []
-        for t in candidates:
-            hidden = "".join(
-                f"<input type='hidden' name='{k}' value='{html.escape(v)}'>"
-                for k, v in {**q, "tenant_id": t.tenant_id}.items()
-            )
-            forms.append(
-                f"<form method='post' action='/mock/adminconsent/complete' class='card'>{hidden}"
-                f"<h3>{html.escape(t.name)} <small>{html.escape(t.domain)}</small></h3>"
-                "<p>Calendar Sync is requesting <b>Calendars.Read</b> (application) for all mailboxes.</p>"
-                "<button name='decision' value='approve'>Accept</button> "
-                "<button name='decision' value='deny' class='secondary'>Cancel</button></form>"
-            )
-        return _page(
-            "Permissions requested",
-            "<p class='muted'>Signed in as a Global Administrator</p>" + "".join(forms),
-        )
-
-    @app.post("/mock/adminconsent/complete")
-    async def admin_consent_complete(
-        request: Request,
-        tenant_id: str = Form(...),
-        client_id: str = Form(...),
-        redirect_uri: str = Form(...),
-        decision: str = Form(...),
-        state: str = Form(""),
-    ) -> Response:
-        s = st(request)
-        if decision == "approve":
-            s.tenants[tenant_id].consented_apps.add(client_id)
-            params = {
-                "admin_consent": "True",
-                "tenant": tenant_id,
-                "state": state,
-                "scope": "https://graph.microsoft.com/.default",
-            }
-        else:
-            params = {
-                "error": "access_denied",
-                "error_description": "AADSTS65004: User declined to consent.",
-                "state": state,
-            }
-        return RedirectResponse(f"{redirect_uri}?{urlencode(params)}", status_code=303)
 
     # -- Graph ------------------------------------------------------------------------
 
@@ -265,6 +248,16 @@ def create_mock_app(state: MockState | None = None, *, seed_demo: bool = True) -
             raise MockGraphError(
                 403, "ErrorAccessDenied", "Access is denied. Check credentials and try again."
             )
+        if claims.get("kind") == "delegated":
+            # Delegated Calendars.Read: only the signed-in user's own mailbox.
+            if user.oid != claims.get("oid"):
+                raise MockGraphError(
+                    403, "ErrorAccessDenied", "Access is denied. Check credentials and try again."
+                )
+            if "Calendars.Read" not in claims.get("scp", "").split():
+                raise MockGraphError(
+                    403, "ErrorAccessDenied", "Access is denied. The token lacks Calendars.Read."
+                )
         return user
 
     def calendar_json(cal) -> dict[str, Any]:
@@ -360,6 +353,8 @@ def create_mock_app(state: MockState | None = None, *, seed_demo: bool = True) -
         sub = st(request).subscriptions.get(sid)
         if sub is None or sub.app_id != claims["appid"] or sub.tenant_id != claims["tid"]:
             raise MockGraphError(404, "ResourceNotFound", f"The object was not found: {sid}")
+        if sub.creator_oid is not None and claims.get("oid") != sub.creator_oid:
+            raise MockGraphError(403, "ExtensionError", "Operation: Access denied for this subscription.")
         return sub
 
     @app.patch("/v1.0/subscriptions/{sid}")
@@ -376,7 +371,8 @@ def create_mock_app(state: MockState | None = None, *, seed_demo: bool = True) -
 
     @app.post("/v1.0/subscriptions/{sid}/reauthorize", status_code=204)
     async def reauthorize(request: Request, sid: str) -> Response:
-        owned_subscription(request, graph_auth(request), sid)
+        claims = graph_auth(request)
+        st(request).reauthorize(owned_subscription(request, claims, sid), claims)
         return Response(status_code=204)
 
     @app.delete("/v1.0/subscriptions/{sid}", status_code=204)
@@ -465,8 +461,8 @@ def create_mock_app(state: MockState | None = None, *, seed_demo: bool = True) -
     async def ui_tenant_action(request: Request, tid: str, action: str = Form(...)) -> Response:
         s = st(request)
         tenant = s.tenants[tid]
-        if action == "revoke":
-            await s.revoke_consent(tid, s.source_app_id)
+        if action == "consent_block":
+            tenant.user_consent_blocked = not tenant.user_consent_blocked
         elif action == "throttle":
             tenant.throttle_remaining += 5
         elif action == "drop":
@@ -475,14 +471,26 @@ def create_mock_app(state: MockState | None = None, *, seed_demo: bool = True) -
             await s.send_lifecycle(tid, action)
         return RedirectResponse("/", status_code=303)
 
+    @app.post("/mock/users/{ref}/revoke")
+    async def ui_revoke_user(request: Request, ref: str, consent: str | None = Form(None)) -> Response:
+        """Revoke a user's refresh tokens (like revokeSignInSessions or a password reset).
+        With consent=1, delete their consent to the source app instead."""
+        s = st(request)
+        user = s.find_user(ref)
+        if user is None:
+            raise MockGraphError(404, "ErrorInvalidUser", f"Unknown user {ref}")
+        await s.revoke_user(user, withdraw_consent=bool(consent))
+        return RedirectResponse("/", status_code=303)
+
     @app.get("/mock/state")
     async def dump_state(request: Request) -> dict:
         s = st(request)
         return {
             "tenants": {
-                t.tenant_id: {"name": t.name, "consented": sorted(t.consented_apps)}
+                t.tenant_id: {"name": t.name, "user_consent_blocked": t.user_consent_blocked}
                 for t in s.tenants.values()
             },
+            "grants": {s.users[oid].upn: sorted(scopes) for (oid, _), scopes in s.grants.items()},
             "subscriptions": [s.subscription_json(x) for x in s.subscriptions.values()],
             "calendars": {
                 c.id: {
@@ -559,11 +567,10 @@ def render_panel(s: MockState) -> str:
     )
 
     for t in s.tenants.values():
-        consented = s.source_app_id in t.consented_apps
         badge = (
-            "<span class='pill ok'>source app consented</span>"
-            if consented
-            else "<span class='pill'>not consented</span>"
+            "<span class='pill bad'>user consent blocked</span>"
+            if t.user_consent_blocked
+            else "<span class='pill ok'>users can consent</span>"
         )
         if t.is_home:
             badge = "<span class='pill'>host tenant · primary calendars</span>"
@@ -578,7 +585,7 @@ def render_panel(s: MockState) -> str:
         )
         if not t.is_home:
             buttons = [
-                ("revoke", "Delete Enterprise app (revoke)"),
+                ("consent_block", "Toggle blocking user consent"),
                 ("throttle", "Throttle next 5 calls"),
                 ("drop", "Toggle dropping notifications"),
                 ("missed", "Send 'missed'"),
@@ -601,6 +608,18 @@ def render_panel(s: MockState) -> str:
                 if t.is_home and u.upn != s.shared_mailbox and not events:
                     continue
                 title = f"{esc(u.display_name)} <small>{esc(u.upn)} · {esc(cal.name)}</small>"
+                if not t.is_home:
+                    scopes = sorted(s.grants.get((u.oid, s.source_app_id), set()))
+                    tokens = sum(1 for g in s.refresh_tokens.values() if g.oid == u.oid)
+                    title += (
+                        f" <small>· granted: {esc(' '.join(scopes)) or 'nothing'} · {tokens} refresh token(s)"
+                        "</small>"
+                        f"<form class='inline' method='post' action='/mock/users/{u.oid}/revoke'> "
+                        "<button class='secondary'>Revoke refresh tokens</button></form>"
+                        f"<form class='inline' method='post' action='/mock/users/{u.oid}/revoke'>"
+                        "<input type='hidden' name='consent' value='1'> "
+                        "<button class='secondary'>Withdraw consent</button></form>"
+                    )
                 rows = []
                 for ev in events:
                     actions = ""

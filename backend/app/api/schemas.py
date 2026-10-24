@@ -23,7 +23,6 @@ class TenantRef(BaseModel):
     id: uuid.UUID
     display_name: str
     tenant_id: str | None
-    consent_status: str
 
 
 class SubscriptionHealth(BaseModel):
@@ -38,7 +37,7 @@ class SourceOut(BaseModel):
     id: uuid.UUID
     label: str
     source_email: str
-    status: str
+    status: str  # active | reauth_required | removing | error
     tenant: TenantRef
     last_synced_at: datetime | None
     last_full_sync_at: datetime | None
@@ -47,7 +46,9 @@ class SourceOut(BaseModel):
     last_error_at: datetime | None
     subscription: SubscriptionHealth | None
     event_count: int
-    consent_url: str | None = None
+    # Where the browser goes to sign in again ("/auth/reauth/{id}") when reauth_required.
+    reauth_url: str | None = None
+    reauth_required_at: datetime | None = None
     created_at: datetime
 
 
@@ -68,13 +69,6 @@ class CalendarEventOut(BaseModel):
     mirrored: bool
 
 
-class TenantCreate(BaseModel):
-    display_name: str = Field(min_length=1, max_length=128)
-    domain: str | None = Field(default=None, max_length=256)
-    tenant_id: str | None = Field(default=None, max_length=64)
-    copy_details: bool = True
-
-
 class TenantUpdate(BaseModel):
     display_name: str | None = Field(default=None, min_length=1, max_length=128)
     copy_details: bool | None = None
@@ -85,18 +79,15 @@ class TenantOut(BaseModel):
     display_name: str
     domain: str | None
     tenant_id: str | None
-    consent_status: str
     copy_details: bool
-    connected_at: datetime | None
-    revoked_at: datetime | None
     last_error: str | None
     created_at: datetime
     source_count: int = 0
     active_source_count: int = 0
+    reauth_required_count: int = 0
     next_subscription_expiry: datetime | None = None
     last_notification_at: datetime | None = None
     errors_24h: int = 0
-    consent_url: str | None = None
 
 
 class UserAdminOut(BaseModel):
@@ -153,7 +144,7 @@ class AuditOut(BaseModel):
 
 class OverviewOut(BaseModel):
     users: int
-    tenants: dict[str, int]
+    tenants: int
     sources: dict[str, int]
     subscriptions: int
     subscriptions_expiring_24h: int

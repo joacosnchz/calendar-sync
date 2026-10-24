@@ -1,4 +1,10 @@
-"""Graph change-notification subscriptions: create, renew, reauthorize, recreate."""
+"""Graph change-notification subscriptions: create, renew, reauthorize, recreate.
+
+Subscriptions on a source mailbox are created with its owner's delegated token, so Graph
+ties them to that grant: when the grant goes away Graph stops delivering, and the source
+is marked reauth_required (see app.sync.lifecycle.mark_reauth_required). After the user
+reconnects, the subscription is recreated and a delta resync covers the gap.
+"""
 
 import logging
 import secrets
@@ -32,10 +38,12 @@ async def _load_source(session: AsyncSession, source_id: uuid.UUID) -> LinkedSou
     )
 
 
-async def delete_remote_subscription(services: Services, tenant_id: str, graph_subscription_id: str) -> None:
-    """Best effort: the subscription may already be gone, or the tenant may have revoked us."""
+async def delete_remote_subscription(
+    services: Services, source_id: uuid.UUID, tenant_id: str, graph_subscription_id: str
+) -> None:
+    """Best effort: the subscription may already be gone, or the grant may be revoked."""
     try:
-        await services.graph.source(tenant_id).delete_subscription(graph_subscription_id)
+        await services.graph.source(source_id, tenant_id).delete_subscription(graph_subscription_id)
     except (GraphError, TokenError) as exc:
         log.info("could not delete subscription %s: %s", graph_subscription_id, exc)
 
@@ -48,11 +56,11 @@ async def create_subscription(services: Services, source_id: uuid.UUID) -> Subsc
         if source is None or source.status != SourceStatus.ACTIVE or not source.tenant.tenant_id:
             return None
         tenant_id = source.tenant.tenant_id
-        graph = services.graph.source(tenant_id)
+        graph = services.graph.source(source.id, tenant_id)
 
         if source.subscription is not None:
             old = source.subscription
-            await delete_remote_subscription(services, tenant_id, old.graph_subscription_id)
+            await delete_remote_subscription(services, source.id, tenant_id, old.graph_subscription_id)
             await session.delete(old)
             await session.flush()
 
@@ -110,14 +118,13 @@ async def renew_subscription(services: Services, subscription_pk: uuid.UUID) -> 
         tenant_id = source.tenant.tenant_id
         assert tenant_id
         if source.status != SourceStatus.ACTIVE:
-            await delete_remote_subscription(services, tenant_id, sub.graph_subscription_id)
-            await session.delete(sub)
-            await session.commit()
-            return "source-inactive"
+            # Paused (reauth_required) or being removed: keep the row; reconnecting
+            # recreates the subscription and unlinking deletes it.
+            return f"skipped-{source.status}"
 
         now = utcnow()
         try:
-            renewed = await services.graph.source(tenant_id).renew_subscription(
+            renewed = await services.graph.source(source.id, tenant_id).renew_subscription(
                 sub.graph_subscription_id, now + timedelta(minutes=settings.subscription_lifetime_minutes)
             )
         except GraphNotFound:
@@ -157,9 +164,14 @@ async def handle_lifecycle(services: Services, graph_subscription_id: str, event
         if sub is None:
             return "unknown-subscription"
         source_id, sub_pk = sub.source_id, sub.id
+        status = sub.source.status
         tenant_id = sub.source.tenant.tenant_id
         assert tenant_id
 
+    if status != SourceStatus.ACTIVE:
+        # Nothing to do until the user reconnects (which recreates the subscription and
+        # resyncs) or the unlink finishes.
+        return f"skipped-{status}"
     if event == "missed":
         await services.queue.enqueue_coalesced(
             sync_key(source_id, SyncMode.RECOVERY), "sync_source", str(source_id), SyncMode.RECOVERY.value
@@ -169,14 +181,18 @@ async def handle_lifecycle(services: Services, graph_subscription_id: str, event
         await recreate_and_resync(services, source_id, tenant_id)
         return "recreated"
     if event == "reauthorizationRequired":
+        # Reauthorizing needs a currently valid delegated token: refreshing it here is
+        # what proves the grant still exists. A TokenError(reauth_required) propagates to
+        # the job runner, which marks the source reauth_required.
+        await services.tokens.invalidate_source(source_id)
         try:
-            await services.graph.source(tenant_id).reauthorize_subscription(graph_subscription_id)
+            await services.graph.source(source_id, tenant_id).reauthorize_subscription(graph_subscription_id)
             return "reauthorized"
         except GraphNotFound:
             await recreate_and_resync(services, source_id, tenant_id)
             return "recreated"
         except GraphError as exc:
-            if exc.transient:
+            if exc.transient or exc.auth_failure:
                 raise
             log.info("reauthorize failed for %s (%s); renewing instead", graph_subscription_id, exc)
             return await renew_subscription(services, sub_pk)

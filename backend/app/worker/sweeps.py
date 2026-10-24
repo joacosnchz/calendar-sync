@@ -7,7 +7,7 @@ from typing import Any
 
 from sqlalchemy import or_, select
 
-from app.models import ConsentStatus, LinkedSource, PrimaryStatus, SourceStatus, Subscription, Tenant, User
+from app.models import LinkedSource, PrimaryStatus, SourceStatus, Subscription, User
 from app.queue import renew_key, sync_key
 from app.services import Services
 from app.sync.mirror import stale_dedup_keys
@@ -21,27 +21,29 @@ SETUP_GRACE = timedelta(minutes=10)
 
 
 async def renew_sweep(ctx: dict[str, Any]) -> str:
-    """FR-6: renew every subscription before it expires; recreate missing ones."""
+    """FR-6: renew every subscription before it expires; recreate missing ones. Only for
+    active sources: a source waiting for its owner to reconnect is left alone."""
     services: Services = ctx["services"]
     now = utcnow()
     async with services.sessionmaker() as session:
         due = (
             await session.scalars(
-                select(Subscription.id).where(
+                select(Subscription.id)
+                .join(LinkedSource, LinkedSource.id == Subscription.source_id)
+                .where(
+                    LinkedSource.status == SourceStatus.ACTIVE,
                     or_(
                         Subscription.renew_due_at <= now, Subscription.expires_at <= now + RENEW_EXPIRY_MARGIN
-                    )
+                    ),
                 )
             )
         ).all()
         missing = (
             await session.scalars(
                 select(LinkedSource.id)
-                .join(Tenant, Tenant.id == LinkedSource.tenant_pk)
                 .outerjoin(Subscription, Subscription.source_id == LinkedSource.id)
                 .where(
                     LinkedSource.status == SourceStatus.ACTIVE,
-                    Tenant.consent_status == ConsentStatus.CONNECTED,
                     Subscription.id.is_(None),
                     LinkedSource.created_at < now - SETUP_GRACE,
                 )

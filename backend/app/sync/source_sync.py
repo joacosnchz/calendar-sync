@@ -148,7 +148,7 @@ async def process_notification(services: Services, graph_subscription_id: str, r
             await session.commit()
             return "inactive"
 
-        graph = services.graph.source(source.tenant.tenant_id)
+        graph = services.graph.source(source.id, source.tenant.tenant_id)
         needs_delta = False
         try:
             raw = await graph.get_event(source.source_user_id, resource_id)
@@ -212,7 +212,7 @@ async def _run_delta(
     services: Services, session: AsyncSession, source: LinkedSource, rebaseline: bool
 ) -> SyncResult:
     assert source.tenant.tenant_id
-    graph = services.graph.source(source.tenant.tenant_id)
+    graph = services.graph.source(source.id, source.tenant.tenant_id)
     result = SyncResult(rebaseline=rebaseline)
     if rebaseline:
         window = current_window(services)

@@ -106,7 +106,7 @@ async def _group_inputs(session, user_id: uuid.UUID, dedup_key: str) -> list[Mir
             .join(Tenant, Tenant.id == LinkedSource.tenant_pk)
             .where(
                 LinkedSource.user_id == user_id,
-                LinkedSource.status == SourceStatus.ACTIVE,
+                LinkedSource.status.in_(SourceStatus.MIRRORED),
                 SourceEvent.dedup_key == dedup_key,
             )
         )
@@ -218,11 +218,12 @@ async def reconcile_group(
 
 async def stale_dedup_keys(session, user_id: uuid.UUID, limit: int = 5000) -> set[str]:
     """Groups whose mirror may not match stored state: never mirrored, changed since the
-    last reconcile, or mirrored with no remaining active source event."""
+    last reconcile, or mirrored with no remaining source event. Sources paused for
+    reauth still count: their mirrors are kept until the user reconnects or unlinks."""
     active = and_(
         LinkedSource.id == SourceEvent.source_id,
         LinkedSource.user_id == user_id,
-        LinkedSource.status == SourceStatus.ACTIVE,
+        LinkedSource.status.in_(SourceStatus.MIRRORED),
     )
     latest = (
         select(SourceEvent.dedup_key, func.max(SourceEvent.updated_at).label("changed"))
@@ -259,7 +260,7 @@ async def all_dedup_keys(session, user_id: uuid.UUID) -> set[str]:
     live = await session.scalars(
         select(SourceEvent.dedup_key)
         .join(LinkedSource, LinkedSource.id == SourceEvent.source_id)
-        .where(LinkedSource.user_id == user_id, LinkedSource.status == SourceStatus.ACTIVE)
+        .where(LinkedSource.user_id == user_id, LinkedSource.status.in_(SourceStatus.MIRRORED))
         .distinct()
     )
     mapped = await session.scalars(select(MirrorMapping.dedup_key).where(MirrorMapping.user_id == user_id))

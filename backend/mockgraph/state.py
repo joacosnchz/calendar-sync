@@ -19,6 +19,9 @@ from app.sync.events import resolve_tz
 log = logging.getLogger("mockgraph")
 
 MAX_SUBSCRIPTION_MINUTES = 4230
+REFRESH_TOKEN_DAYS = 90
+# Scopes that are part of every sign-in and never need consent on their own.
+OIDC_SCOPES = {"openid", "profile", "email", "offline_access"}
 
 
 def now_utc() -> datetime:
@@ -73,6 +76,10 @@ class MockUser:
     upn: str
     display_name: str
     default_calendar_id: str = ""
+    # Bumped by "revoke sessions": refresh tokens and delegated access tokens issued
+    # before it stop working (Graph enforces it immediately, like Continuous Access
+    # Evaluation does for user revocation).
+    session_generation: int = 0
 
 
 @dataclass
@@ -81,10 +88,23 @@ class MockTenant:
     name: str
     domain: str
     is_home: bool = False
+    # Apps with application permissions here (only our primary app, in the home tenant).
     consented_apps: set[str] = field(default_factory=set)
     users: dict[str, MockUser] = field(default_factory=dict)
     throttle_remaining: int = 0
     drop_notifications: bool = False
+    # Entra "Do not allow user consent": users can't grant new delegated permissions.
+    user_consent_blocked: bool = False
+
+
+@dataclass
+class MockRefreshToken:
+    oid: str
+    tenant_id: str
+    client_id: str
+    scopes: list[str]
+    generation: int
+    expires_at: datetime
 
 
 @dataclass
@@ -109,6 +129,10 @@ class MockSubscription:
     client_state: str | None
     expiration: datetime
     change_types: set[str]
+    # Delegated subscriptions belong to the signed-in user's grant: when it's revoked,
+    # Graph stops delivering until the subscription is reauthorized or recreated.
+    creator_oid: str | None = None
+    creator_generation: int = 0
 
 
 @dataclass
@@ -156,6 +180,9 @@ class MockState:
         self.calendars: dict[str, MockCalendar] = {}
         self.subscriptions: dict[str, MockSubscription] = {}
         self.codes: dict[str, dict[str, Any]] = {}
+        self.refresh_tokens: dict[str, MockRefreshToken] = {}
+        # Delegated permissions each user granted to each app: (oid, client_id) -> scopes.
+        self.grants: dict[tuple[str, str], set[str]] = {}
         self.delta_sessions: dict[str, list[str]] = {}
         self.deliveries: list[Delivery] = []
         self.max_page_size = 50
@@ -202,10 +229,7 @@ class MockState:
 
     # -- tokens -----------------------------------------------------------------------
 
-    def issue_app_token(self, tenant_ref: str, client_id: str, client_secret: str | None) -> dict[str, Any]:
-        tenant = self.find_tenant(tenant_ref)
-        if tenant is None:
-            raise MockGraphError(400, "invalid_tenant", f"AADSTS90002: Tenant '{tenant_ref}' not found.")
+    def _check_client(self, client_id: str, client_secret: str | None) -> None:
         expected = {self.source_app_id: self.source_app_secret, self.primary_app_id: self.primary_app_secret}
         if client_id not in expected:
             raise MockGraphError(
@@ -215,24 +239,116 @@ class MockState:
             )
         if client_secret != expected[client_id]:
             raise MockGraphError(401, "invalid_client", "AADSTS7000215: Invalid client secret provided.")
-        if client_id == self.primary_app_id and not tenant.is_home:
+
+    def issue_app_token(self, tenant_ref: str, client_id: str, client_secret: str | None) -> dict[str, Any]:
+        tenant = self.find_tenant(tenant_ref)
+        if tenant is None:
+            raise MockGraphError(400, "invalid_tenant", f"AADSTS90002: Tenant '{tenant_ref}' not found.")
+        self._check_client(client_id, client_secret)
+        if client_id == self.source_app_id:
+            raise MockGraphError(
+                400,
+                "unauthorized_client",
+                f"AADSTS700016: Application '{client_id}' has no application permissions in tenant "
+                f"'{tenant.tenant_id}'. The source app is delegated-only: use a user's refresh token.",
+            )
+        if not tenant.is_home:
             raise MockGraphError(
                 400,
                 "unauthorized_client",
                 "AADSTS700016: Application not found in the directory (single-tenant app).",
-            )
-        if client_id not in tenant.consented_apps:
-            raise MockGraphError(
-                400,
-                "unauthorized_client",
-                f"AADSTS7000229: The client application {client_id} is missing service principal in the tenant "
-                f"{tenant.tenant_id}.",
             )
         return {
             "token_type": "Bearer",
             "expires_in": 3599,
             "access_token": self.sign({"kind": "app", "tid": tenant.tenant_id, "appid": client_id}),
         }
+
+    def consent_needed(self, user: MockUser, client_id: str, scopes: list[str]) -> set[str]:
+        granted = self.grants.get((user.oid, client_id), set())
+        return {s for s in scopes if s not in OIDC_SCOPES} - granted
+
+    def grant(self, user: MockUser, client_id: str, scopes: list[str]) -> None:
+        self.grants.setdefault((user.oid, client_id), set()).update(s for s in scopes if s not in OIDC_SCOPES)
+
+    def delegated_tokens(self, user: MockUser, client_id: str, scopes: list[str]) -> dict[str, Any]:
+        """Access token (+ rotated refresh token when offline_access was requested)."""
+        granted = sorted(self.grants.get((user.oid, client_id), set()))
+        body: dict[str, Any] = {
+            "token_type": "Bearer",
+            "scope": " ".join([*granted, *[s for s in scopes if s in OIDC_SCOPES]]),
+            "expires_in": 3599,
+            "access_token": self.sign(
+                {
+                    "kind": "delegated",
+                    "tid": user.tenant_id,
+                    "oid": user.oid,
+                    "appid": client_id,
+                    "scp": " ".join(granted),
+                    "gen": user.session_generation,
+                }
+            ),
+        }
+        if "offline_access" in scopes:
+            token = "mrt." + secrets.token_urlsafe(32)
+            self.refresh_tokens[token] = MockRefreshToken(
+                oid=user.oid,
+                tenant_id=user.tenant_id,
+                client_id=client_id,
+                scopes=scopes,
+                generation=user.session_generation,
+                expires_at=now_utc() + timedelta(days=REFRESH_TOKEN_DAYS),
+            )
+            body["refresh_token"] = token
+        return body
+
+    def redeem_refresh_token(
+        self, tenant_ref: str, client_id: str, client_secret: str | None, token: str, scope: str
+    ) -> dict[str, Any]:
+        self._check_client(client_id, client_secret)
+        grant = self.refresh_tokens.pop(token, None)  # single use: every redemption rotates
+        expired = MockGraphError(
+            400,
+            "invalid_grant",
+            "AADSTS700082: The refresh token has expired due to inactivity or was revoked. "
+            "The user must sign in again.",
+        )
+        if grant is None or grant.client_id != client_id or grant.expires_at < now_utc():
+            raise expired
+        user = self.users.get(grant.oid)
+        if user is None or grant.generation != user.session_generation:
+            raise expired
+        tenant = self.find_tenant(tenant_ref) if tenant_ref not in ("organizations", "common") else None
+        if tenant_ref not in ("organizations", "common") and (
+            tenant is None or tenant.tenant_id != grant.tenant_id
+        ):
+            raise MockGraphError(
+                400, "invalid_grant", "AADSTS50020: The refresh token was issued for a different tenant."
+            )
+        requested = [s.rsplit("/", 1)[-1] for s in scope.split()]
+        missing = self.consent_needed(user, client_id, requested)
+        if missing:
+            raise MockGraphError(
+                400,
+                "invalid_grant",
+                f"AADSTS65001: The user or administrator has not consented to use the application "
+                f"with ID '{client_id}'. Send an interactive authorization request for this user and "
+                f"resource. Missing: {' '.join(sorted(missing))}",
+            )
+        return self.delegated_tokens(user, client_id, sorted(set(requested) | {"offline_access"}))
+
+    def revoke_sessions(self, user: MockUser) -> int:
+        """Like revokeSignInSessions / a password reset: refresh tokens die immediately."""
+        user.session_generation += 1
+        revoked = [t for t, g in self.refresh_tokens.items() if g.oid == user.oid]
+        for token in revoked:
+            del self.refresh_tokens[token]
+        return len(revoked)
+
+    def withdraw_consent(self, user: MockUser, client_id: str) -> None:
+        """The user removed the app at myapps.microsoft.com (delegated grant deleted).
+        Refresh tokens then fail with AADSTS65001 (consent required)."""
+        self.grants.pop((user.oid, client_id), None)
 
     def sign(self, claims: dict[str, Any]) -> str:
         import jwt
@@ -250,6 +366,14 @@ class MockState:
         tenant = self.tenants.get(claims["tid"])
         if claims.get("kind") == "app" and (tenant is None or claims["appid"] not in tenant.consented_apps):
             raise MockGraphError(401, "InvalidAuthenticationToken", "Application access has been revoked.")
+        if claims.get("kind") == "delegated":
+            user = self.users.get(claims.get("oid", ""))
+            if user is None or claims.get("gen") != user.session_generation:
+                raise MockGraphError(
+                    401,
+                    "InvalidAuthenticationToken",
+                    "Continuous access evaluation resulted in challenge: the user's sessions were revoked.",
+                )
         return claims
 
     # -- events -----------------------------------------------------------------------
@@ -428,7 +552,8 @@ class MockState:
 
     # -- subscriptions ----------------------------------------------------------------
 
-    def parse_resource(self, resource: str, tenant_id: str) -> tuple[MockUser, str]:
+    def parse_resource(self, resource: str, claims: dict[str, Any]) -> tuple[MockUser, str]:
+        tenant_id = claims["tid"]
         parts = [p for p in resource.strip("/").split("/") if p]
         lowered = [p.lower() for p in parts]
         if len(parts) < 3 or lowered[0] != "users" or lowered[-1] != "events":
@@ -436,6 +561,15 @@ class MockState:
         user = self.find_user(parts[1])
         if user is None or user.tenant_id != tenant_id:
             raise MockGraphError(404, "ResourceNotFound", "Resource not found for the segment 'users'.")
+        if claims.get("kind") == "delegated":
+            if user.oid != claims["oid"]:
+                raise MockGraphError(
+                    403, "ExtensionError", "Operation: Create; Exception: [Access is denied.]"
+                )
+            if "Calendars.Read" not in claims.get("scp", "").split():
+                raise MockGraphError(
+                    403, "ExtensionError", "Insufficient privileges: Calendars.Read required."
+                )
         if len(parts) == 5 and lowered[2] == "calendars":
             return user, self.calendar_for(user, parts[3]).id
         return user, user.default_calendar_id
@@ -463,7 +597,7 @@ class MockState:
             raise MockGraphError(
                 400, "ExtensionError", "Subscription expiration can only be 4230 minutes in the future."
             )
-        user, calendar_id = self.parse_resource(body["resource"], claims["tid"])
+        user, calendar_id = self.parse_resource(body["resource"], claims)
         await self.validate_endpoint(body["notificationUrl"])
         if body.get("lifecycleNotificationUrl"):
             await self.validate_endpoint(body["lifecycleNotificationUrl"])
@@ -480,6 +614,9 @@ class MockState:
             expiration=expiration,
             change_types=set(body.get("changeType", "").split(",")),
         )
+        if claims.get("kind") == "delegated":
+            sub.creator_oid = claims["oid"]
+            sub.creator_generation = claims.get("gen", 0)
         self.subscriptions[sub.id] = sub
         return sub
 
@@ -525,6 +662,11 @@ class MockState:
             if tenant.drop_notifications:
                 self.deliveries.append(Delivery(now, "dropped", sub.notification_url, "dropped", event_id))
                 continue
+            if not self.subscription_authorized(sub):
+                self.deliveries.append(
+                    Delivery(now, "suspended", sub.notification_url, "grant revoked", event_id)
+                )
+                continue
             resource = f"Users/{user.oid}/Events/{event_id}"
             await self._deliver(
                 f"notification:{change}",
@@ -568,6 +710,39 @@ class MockState:
             },
         )
 
+    def reauthorize(self, sub: MockSubscription, claims: dict[str, Any]) -> None:
+        if sub.creator_oid is not None:
+            if claims.get("oid") != sub.creator_oid:
+                raise MockGraphError(
+                    403, "ExtensionError", "Only the subscription's owner can reauthorize it."
+                )
+            sub.creator_generation = claims.get("gen", 0)
+
+    def subscription_authorized(self, sub: MockSubscription) -> bool:
+        if sub.creator_oid is None:
+            return True
+        creator = self.users.get(sub.creator_oid)
+        return (
+            creator is not None
+            and creator.session_generation == sub.creator_generation
+            and "Calendars.Read" in self.grants.get((creator.oid, sub.app_id), set())
+        )
+
+    def user_subscriptions(self, user: MockUser) -> list[MockSubscription]:
+        return [s for s in self.subscriptions.values() if s.creator_oid == user.oid]
+
+    async def revoke_user(self, user: MockUser, *, withdraw_consent: bool = False) -> int:
+        """Revoke a user's refresh tokens (optionally also their consent). Graph asks the
+        app to reauthorize the user's subscriptions, which it can no longer do."""
+        revoked = 0
+        if withdraw_consent:
+            self.withdraw_consent(user, self.source_app_id)
+        else:
+            revoked = self.revoke_sessions(user)
+        for sub in self.user_subscriptions(user):
+            await self.lifecycle(sub, "reauthorizationRequired")
+        return revoked
+
     def tenant_subscriptions(self, tenant_id: str) -> list[MockSubscription]:
         return [s for s in self.subscriptions.values() if s.tenant_id == tenant_id]
 
@@ -579,18 +754,18 @@ class MockState:
                 self.subscriptions.pop(sub.id, None)
         return len(subs)
 
-    async def revoke_consent(self, tenant_id: str, app_id: str) -> None:
-        """Simulates the customer admin deleting our Enterprise application."""
-        tenant = self.tenants[tenant_id]
-        tenant.consented_apps.discard(app_id)
-        for sub in self.tenant_subscriptions(tenant_id):
-            if sub.app_id == app_id:
-                await self.lifecycle(sub, "subscriptionRemoved")
-                self.subscriptions.pop(sub.id, None)
+    # -- persistence (so a container restart doesn't forget grants and mailboxes) ------
 
-    # -- persistence (so a container restart doesn't forget consent and mailboxes) -----
-
-    _PERSISTED = ("tenants", "users", "calendars", "subscriptions", "seq", "deliveries")
+    _PERSISTED = (
+        "tenants",
+        "users",
+        "calendars",
+        "subscriptions",
+        "seq",
+        "deliveries",
+        "refresh_tokens",
+        "grants",
+    )
 
     def save(self, path: str) -> None:
         tmp = f"{path}.tmp"
@@ -604,7 +779,8 @@ class MockState:
         with open(path, "rb") as fh:
             data = pickle.load(fh)  # noqa: S301 - our own file on a private volume
         for key in self._PERSISTED:
-            setattr(self, key, data[key])
+            if key in data:  # files written by older versions lack the newer keys
+                setattr(self, key, data[key])
         return True
 
     async def drain(self) -> None:

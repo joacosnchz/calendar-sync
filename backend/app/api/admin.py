@@ -1,4 +1,9 @@
-"""Operator API: tenant onboarding (FR-1), primary calendars (FR-2), sync health (FR-13)."""
+"""Operator API: customer tenants (FR-1), primary calendars (FR-2), sync health (FR-13).
+
+Customer tenants are recorded automatically the first time a user links a mailbox from
+one; there is no onboarding or admin consent step. Operators can rename them and set the
+per-tenant privacy control.
+"""
 
 import uuid
 from datetime import timedelta
@@ -9,11 +14,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import schemas
 from app.api.deps import csrf_protect, get_services, get_session, require_operator
-from app.api.me import consent_link
 from app.audit import audit
 from app.models import (
     AuditLog,
-    ConsentStatus,
     LinkedSource,
     MirrorMapping,
     PrimaryStatus,
@@ -38,17 +41,12 @@ async def overview(
     _: User = Depends(require_operator), session: AsyncSession = Depends(get_session)
 ) -> schemas.OverviewOut:
     now = utcnow()
-    tenants = dict(
-        (
-            await session.execute(select(Tenant.consent_status, func.count()).group_by(Tenant.consent_status))
-        ).all()
-    )
     sources = dict(
         (await session.execute(select(LinkedSource.status, func.count()).group_by(LinkedSource.status))).all()
     )
     return schemas.OverviewOut(
         users=await session.scalar(select(func.count()).select_from(User)) or 0,
-        tenants=tenants,
+        tenants=await session.scalar(select(func.count()).select_from(Tenant)) or 0,
         sources=sources,
         subscriptions=await session.scalar(select(func.count()).select_from(Subscription)) or 0,
         subscriptions_expiring_24h=await session.scalar(
@@ -79,9 +77,7 @@ async def overview(
 # --- tenants -------------------------------------------------------------------------
 
 
-async def _tenant_out(
-    services: Services, session: AsyncSession, tenants: list[Tenant]
-) -> list[schemas.TenantOut]:
+async def _tenant_out(session: AsyncSession, tenants: list[Tenant]) -> list[schemas.TenantOut]:
     ids = [t.id for t in tenants]
     since = utcnow() - timedelta(hours=24)
     stats = {
@@ -92,6 +88,9 @@ async def _tenant_out(
                     LinkedSource.tenant_pk,
                     func.count().label("total"),
                     func.count().filter(LinkedSource.status == SourceStatus.ACTIVE).label("active"),
+                    func.count()
+                    .filter(LinkedSource.status == SourceStatus.REAUTH_REQUIRED)
+                    .label("reauth_required"),
                     func.max(LinkedSource.last_notification_at).label("last_notification"),
                     func.min(Subscription.expires_at).label("next_expiry"),
                 )
@@ -119,20 +118,15 @@ async def _tenant_out(
                 display_name=t.display_name,
                 domain=t.domain,
                 tenant_id=t.tenant_id,
-                consent_status=t.consent_status,
                 copy_details=t.copy_details,
-                connected_at=t.connected_at,
-                revoked_at=t.revoked_at,
                 last_error=t.last_error,
                 created_at=t.created_at,
                 source_count=s.total if s else 0,
                 active_source_count=s.active if s else 0,
+                reauth_required_count=s.reauth_required if s else 0,
                 next_subscription_expiry=s.next_expiry if s else None,
                 last_notification_at=s.last_notification if s else None,
                 errors_24h=errors.get(t.id, 0),
-                consent_url=consent_link(services, t)
-                if t.consent_status != ConsentStatus.CONNECTED
-                else None,
             )
         )
     return out
@@ -140,50 +134,10 @@ async def _tenant_out(
 
 @router.get("/tenants", response_model=list[schemas.TenantOut])
 async def list_tenants(
-    _: User = Depends(require_operator),
-    services: Services = Depends(get_services),
-    session: AsyncSession = Depends(get_session),
+    _: User = Depends(require_operator), session: AsyncSession = Depends(get_session)
 ) -> list[schemas.TenantOut]:
     tenants = list((await session.scalars(select(Tenant).order_by(Tenant.display_name))).all())
-    return await _tenant_out(services, session, tenants)
-
-
-@router.post("/tenants", response_model=schemas.TenantOut, status_code=201)
-async def create_tenant(
-    body: schemas.TenantCreate,
-    operator: User = Depends(require_operator),
-    services: Services = Depends(get_services),
-    session: AsyncSession = Depends(get_session),
-) -> schemas.TenantOut:
-    if body.tenant_id:
-        if body.tenant_id == services.settings.home_tenant_id:
-            raise HTTPException(400, "The host tenant can't be onboarded as a source")
-        if await session.scalar(select(Tenant.id).where(Tenant.tenant_id == body.tenant_id)):
-            raise HTTPException(409, "Tenant already exists")
-    tenant = Tenant(
-        display_name=body.display_name,
-        domain=(body.domain or "").strip().lower() or None,
-        tenant_id=body.tenant_id or None,
-        copy_details=body.copy_details,
-    )
-    session.add(tenant)
-    await session.flush()
-    audit(session, "tenant.created", "tenant", tenant.id, actor=operator, name=tenant.display_name)
-    await session.commit()
-    return (await _tenant_out(services, session, [tenant]))[0]
-
-
-@router.get("/tenants/{tenant_pk}/consent-link")
-async def tenant_consent_link(
-    tenant_pk: uuid.UUID,
-    _: User = Depends(require_operator),
-    services: Services = Depends(get_services),
-    session: AsyncSession = Depends(get_session),
-) -> dict:
-    tenant = await session.get(Tenant, tenant_pk)
-    if tenant is None:
-        raise HTTPException(404, "Tenant not found")
-    return {"url": consent_link(services, tenant)}
+    return await _tenant_out(session, tenants)
 
 
 @router.patch("/tenants/{tenant_pk}", response_model=schemas.TenantOut)
@@ -220,25 +174,7 @@ async def update_tenant(
             by_user.setdefault(user_id, set()).add(key)
         for user_id, keys in by_user.items():
             await enqueue_reconciles(services, user_id, keys)
-    return (await _tenant_out(services, session, [tenant]))[0]
-
-
-@router.post("/tenants/{tenant_pk}/revoke", status_code=202)
-async def revoke_tenant(
-    tenant_pk: uuid.UUID,
-    operator: User = Depends(require_operator),
-    services: Services = Depends(get_services),
-    session: AsyncSession = Depends(get_session),
-) -> dict:
-    tenant = await session.get(Tenant, tenant_pk)
-    if tenant is None:
-        raise HTTPException(404, "Tenant not found")
-    audit(session, "tenant.revoke_requested", "tenant", tenant.id, actor=operator)
-    await session.commit()
-    await services.queue.enqueue(
-        "revoke_tenant", str(tenant.id), f"disconnected by operator {operator.email}"
-    )
-    return {"status": "revoking"}
+    return (await _tenant_out(session, [tenant]))[0]
 
 
 # --- users ---------------------------------------------------------------------------

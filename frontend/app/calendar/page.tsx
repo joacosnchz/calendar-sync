@@ -19,7 +19,8 @@ function Calendar() {
   const query = new URLSearchParams({ start: weekStart.toISOString(), end: weekEnd.toISOString() });
   const events = useResource<CalendarEvent[]>(`/api/calendar?${query}`, 10_000);
   const sources = useResource<Source[]>("/api/sources");
-  const active = sources.data?.filter((s) => s.status === "active") ?? [];
+  // Sources awaiting sign-in keep their mirrored events, so they stay in the legend.
+  const shown = sources.data?.filter((s) => s.status === "active" || s.status === "reauth_required") ?? [];
   const colorFor = labelColors((sources.data ?? []).map((s) => s.label));
 
   const title = `${weekStart.toLocaleDateString(undefined, { month: "long", day: "numeric" })} – ${addDays(
@@ -41,10 +42,11 @@ function Calendar() {
       </div>
 
       <div className="flex flex-wrap items-center gap-4 text-sm text-slate-600">
-        {active.map((s) => (
+        {shown.map((s) => (
           <span key={s.id} className="flex items-center gap-1.5">
             <span className={`h-2.5 w-2.5 rounded-full ${colorFor(s.label).dot}`} />
             {s.label}
+            {s.status === "reauth_required" && <span className="text-xs text-amber-700">(paused)</span>}
           </span>
         ))}
         <span className="ml-auto text-xs text-slate-500">

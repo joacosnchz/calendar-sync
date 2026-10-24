@@ -1,12 +1,11 @@
 "use client";
 
-import { useRouter } from "next/navigation";
 import { useState } from "react";
 
 import { AppShell } from "@/components/AppShell";
-import { Badge, Button, Card, CopyButton, ErrorNote, LinkButton, Spinner, StatusBadge } from "@/components/ui";
-import { del, patch, post, type Me, type Source } from "@/lib/api";
-import { dateTime, labelColors, relativeTime, type LabelColor } from "@/lib/format";
+import { Badge, Button, Card, ErrorNote, LinkButton, Spinner, StatusBadge } from "@/components/ui";
+import { del, navigate, patch, post, type Me, type Source } from "@/lib/api";
+import { dateTime, labelColors, reauthSummary, relativeTime, type LabelColor } from "@/lib/format";
 import { useResource } from "@/lib/hooks";
 
 export default function DashboardPage() {
@@ -16,9 +15,12 @@ export default function DashboardPage() {
 function Dashboard({ me }: { me: Me }) {
   // Poll so linking, backfill and unlinking progress show up without a refresh.
   const sources = useResource<Source[]>("/api/sources", 5000);
+  const needReauth = sources.data?.filter((s) => s.status === "reauth_required") ?? [];
 
   return (
     <div className="space-y-8">
+      {needReauth.length > 0 && <ReauthBanner sources={needReauth} />}
+
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold text-slate-900">Linked accounts</h1>
@@ -62,6 +64,30 @@ function Dashboard({ me }: { me: Me }) {
       <DangerZone />
     </div>
   );
+}
+
+function ReauthBanner({ sources }: { sources: Source[] }) {
+  return (
+    <div className="flex flex-wrap items-center gap-4 rounded-xl border border-amber-300 bg-amber-50 p-5 text-amber-900">
+      <div className="grid h-10 w-10 shrink-0 place-items-center rounded-full bg-amber-100 text-lg font-semibold text-amber-700">
+        !
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="font-medium">{reauthSummary(sources.length)}</div>
+        <p className="mt-0.5 text-sm">
+          Syncing is paused for {sources.map((s) => s.source_email).join(", ")}. Events already in your unified
+          calendar stay there, but new changes won&apos;t appear until you reconnect
+          {sources.length > 1 ? " each account below." : "."}
+        </p>
+      </div>
+      {sources.length === 1 && <LinkButton href={reauthHref(sources[0])}>Reconnect</LinkButton>}
+    </div>
+  );
+}
+
+// The backend always sets reauth_url for reauth_required sources; fall back to the route it points at.
+function reauthHref(source: Source) {
+  return source.reauth_url ?? `/auth/reauth/${source.id}`;
 }
 
 function PrimaryCard({ me }: { me: Me }) {
@@ -194,22 +220,21 @@ function SourceCard({
         </div>
       </div>
 
-      {source.status === "pending_consent" && source.consent_url && (
-        <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
-          <div className="font-medium">Waiting for {source.tenant.display_name}&apos;s IT admin</div>
-          <p className="mt-1">
-            An administrator must approve read-only calendar access once for the organization. Send them this link:
-          </p>
-          <div className="mt-3 flex items-center gap-2">
-            <code className="min-w-0 flex-1 truncate rounded bg-white px-2 py-1 text-xs">{source.consent_url}</code>
-            <CopyButton value={source.consent_url} label="Copy link" />
+      {source.status === "reauth_required" && (
+        <div className="mt-4 flex flex-wrap items-start gap-4 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
+          <div className="min-w-0 flex-1">
+            <div className="font-medium">Sign in to {source.source_email} again</div>
+            <p className="mt-1">
+              Syncing paused{" "}
+              {source.reauth_required_at && (
+                <span title={dateTime(source.reauth_required_at)}>{relativeTime(source.reauth_required_at)} </span>
+              )}
+              because our access to this calendar expired or was revoked. Events already mirrored from it stay in your
+              unified calendar; once you reconnect, changes made in the meantime are caught up automatically.
+            </p>
+            {source.last_error && <p className="mt-2 text-xs text-amber-800">Reason: {source.last_error}</p>}
           </div>
-        </div>
-      )}
-      {source.status === "revoked" && (
-        <div className="mt-4 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-800">
-          {source.tenant.display_name}&apos;s administrator removed access. Mirrored events from this account were
-          removed.
+          <LinkButton href={reauthHref(source)}>Reconnect</LinkButton>
         </div>
       )}
 
@@ -237,7 +262,7 @@ function SourceCard({
           />
         </dl>
       )}
-      {source.last_error && (
+      {source.last_error && source.status !== "reauth_required" && (
         <div className="mt-3">
           <ErrorNote error={`Last error ${relativeTime(source.last_error_at)}: ${source.last_error}`} />
         </div>
@@ -261,7 +286,6 @@ function Metric({ label, value, title }: { label: string; value: React.ReactNode
 }
 
 function DangerZone() {
-  const router = useRouter();
   const [busy, setBusy] = useState(false);
   return (
     <Card className="flex flex-wrap items-center justify-between gap-4 border-rose-100 p-5">
@@ -278,7 +302,7 @@ function DangerZone() {
           if (!confirm("Delete your account and remove all mirrored events? This can't be undone.")) return;
           setBusy(true);
           await del("/api/me");
-          router.replace("/");
+          navigate("/");
         }}
       >
         Delete account

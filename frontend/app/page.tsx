@@ -15,7 +15,7 @@ const STEPS = [
   },
   {
     title: "Link your calendars",
-    body: "Sign in to each organization's account you own. Your IT admin approves read-only access once.",
+    body: "Sign in with the work account you use at each organization and approve read-only calendar access yourself.",
   },
   {
     title: "See everything in Outlook",
@@ -25,7 +25,8 @@ const STEPS = [
 
 export default function Landing() {
   const router = useRouter();
-  const me = useResource<Me>("/api/me");
+  // Anonymous visitors are expected here, so a 401 must not redirect to sign-in.
+  const me = useResource<Me>("/api/me", undefined, { anonymous: true });
 
   useEffect(() => {
     if (me.data) router.replace("/dashboard");

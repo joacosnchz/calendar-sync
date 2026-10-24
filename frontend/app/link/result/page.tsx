@@ -30,16 +30,25 @@ function LinkResult() {
       </ResultPage>
     );
   }
-  if (status === "consent_required") {
+  if (status === "reconnected") {
     return (
-      <ResultPage tone="warn" title="Waiting for your IT admin" action={back}>
+      <ResultPage tone="good" title="Reconnected" action={back}>
         <p>
-          We confirmed that <b>{email}</b> is yours, but its organization hasn&apos;t approved Calendar Sync yet.
+          <b>{email}</b> is syncing again. Any changes made while it was paused are being caught up automatically.
         </p>
+      </ResultPage>
+    );
+  }
+  if (status === "admin_approval_required") {
+    return (
+      <ResultPage tone="warn" title="Your IT admin needs to approve Calendar Sync" action={back}>
         <p>
-          Your accounts page has a one-time approval link to send to that organization&apos;s administrator. Syncing
-          starts automatically once they approve.
+          Your organization doesn&apos;t let people approve apps by themselves. Ask your IT admin to approve
+          &quot;Calendar Sync&quot; (read-only access to calendars), for example with the &quot;request
+          approval&quot; option on Microsoft&apos;s sign-in screen.
         </p>
+        <p>Once it&apos;s approved, link the account again.</p>
+        {message && <p className="text-xs text-slate-500">Details: {message}</p>}
       </ResultPage>
     );
   }

@@ -1,9 +1,11 @@
 """End-to-end smoke test against a running stack (docker compose, mock profile).
 
-Drives the real services the way a browser would: OAuth redirects, cookies, admin
-consent, then changes in the mock Graph control panel, and checks each change reaches
-the user's primary calendar. Needs a fresh stack (it onboards tenants and signs users up). Run from the host
-network so localhost URLs resolve:
+Drives the real services the way a browser would: OAuth redirects and cookies (each
+user consents to delegated Calendars.Read for their own mailbox; no admin consent), then
+changes in the mock Graph control panel, and checks each change reaches the user's
+primary calendar. Also revokes a user's refresh tokens and reconnects the source.
+Needs a fresh stack (it signs users up and links mailboxes). Run from the host network
+so localhost URLs resolve:
 
     docker compose down -v && docker compose up -d --build
     docker run --rm --network host calendar-sync-backend:local python scripts/e2e_smoke.py
@@ -44,9 +46,13 @@ class Smoke:
         """Run a sign-in round trip and return the final URL the browser lands on."""
         resp = await client.get(f"{self.web}{start}")
         assert resp.status_code in (302, 307), resp.text
-        query = {k: v[0] for k, v in parse_qs(urlparse(resp.headers["location"]).query).items()}
+        authorize = urlparse(resp.headers["location"])
+        query = {k: v[0] for k, v in parse_qs(authorize.query).items()}
+        tenant_path = authorize.path.strip("/").split("/")[0]  # organizations or a tenant id
         oid = next(u["oid"] for u in await self.users() if u["upn"] == upn)
-        resp = await client.get(f"{self.mock}/mock/authorize/complete", params={**query, "oid": oid})
+        resp = await client.get(
+            f"{self.mock}/mock/authorize/complete", params={**query, "oid": oid, "tenant_path": tenant_path}
+        )
         resp = await client.get(resp.headers["location"])  # our /auth/callback
         return resp.headers.get("location", "")
 
@@ -67,16 +73,6 @@ class Smoke:
             if cal["owner"] == PRIMARY_MAILBOX and cal["name"] != "Calendar"
             for e in cal["events"]
         ]
-
-    async def consent(self, url: str, tenant_id: str) -> str:
-        query = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
-        async with self.browser() as c:
-            resp = await c.post(
-                f"{self.mock}/mock/adminconsent/complete",
-                data={**query, "tenant_id": tenant_id, "decision": "approve"},
-            )
-            resp = await c.get(resp.headers["location"])
-            return resp.headers["location"]
 
     async def check(self, name: str, fn: Callable[[], Awaitable[str | None]]) -> None:
         started = time.perf_counter()
@@ -121,21 +117,27 @@ async def main(web: str, mock: str) -> int:
         assert me["is_operator"], me
         return landed
 
-    async def onboard(name: str) -> Callable[[], Awaitable[str]]:
-        async def run() -> str:
-            tenant = (await operator.post(f"{web}/api/admin/tenants", json={"display_name": name})).json()
-            landed = await s.consent(tenant["consent_url"], tenants[name])
-            assert "status=connected" in landed, landed
-            return landed.split("?")[1]
-
-        return run
-
     async def alice_signs_in_and_links() -> str:
         await s.oauth(alice, "/auth/login", "alice@contoso.example")
         for upn in ("alice@contoso.example", "alice@fabrikam.example"):
             landed = await s.oauth(alice, "/auth/link", upn)
             assert "status=linked" in landed, landed
-        return "2 sources linked"
+        return "2 sources linked, each with the user's own consent"
+
+    async def admin_approval_required() -> str:
+        northwind = tenants["Northwind Traders"]
+        async with httpx.AsyncClient() as c:
+            await c.post(f"{mock}/mock/tenants/{northwind}", data={"action": "consent_block"})
+            try:
+                landed = await s.oauth(alice, "/auth/link", "alice@northwind.example")
+            finally:
+                await c.post(f"{mock}/mock/tenants/{northwind}", data={"action": "consent_block"})
+        assert "status=admin_approval_required" in landed, landed
+        return "tenant that blocks user consent is reported, nothing linked"
+
+    async def source_status(email: str) -> dict:
+        sources = (await alice.get(f"{web}/api/sources")).json()
+        return next(x for x in sources if x["source_email"] == email)
 
     async def backfill() -> str:
         took = await s.wait_for(
@@ -235,19 +237,43 @@ async def main(web: str, mock: str) -> int:
 
     async def revoke() -> str:
         async with httpx.AsyncClient() as c:
-            await c.post(f"{mock}/mock/tenants/{tenants['Contoso']}", data={"action": "revoke"})
-        took = await s.wait_for(lambda m: not any(x.startswith("[Contoso]") for x in subjects(m)), timeout=30)
-        sources = (await alice.get(f"{web}/api/sources")).json()
-        status = {x["source_email"]: x["status"] for x in sources}
-        assert status["alice@contoso.example"] == "revoked", status
+            await c.post(f"{mock}/mock/users/alice@contoso.example/revoke")
+        deadline = time.perf_counter() + 30
+        while (await source_status("alice@contoso.example"))["status"] != "reauth_required":
+            if time.perf_counter() > deadline:
+                raise TimeoutError(await source_status("alice@contoso.example"))
+            await asyncio.sleep(0.3)
+        source = await source_status("alice@contoso.example")
+        assert source["reauth_url"] == f"/auth/reauth/{source['id']}", source
         remaining = subjects(await s.mirrors())
-        assert "[Fabrikam] Contoso x Fabrikam partnership" in remaining, remaining
-        return f"Contoso mirrors removed in {took:.1f}s; shared meeting now labelled Fabrikam only"
+        assert "[Contoso] Contoso weekly sync" in remaining, remaining
+        return f"paused with mirrors kept: {source['last_error']}"
+
+    async def reconnect() -> str:
+        async with httpx.AsyncClient() as c:
+            await c.post(
+                f"{mock}/mock/events",
+                data={
+                    "mailbox_upn": "alice@contoso.example",
+                    "subject": "Smoke: while paused",
+                    "date": day(5),
+                },
+            )
+        await asyncio.sleep(1)
+        assert "[Contoso] Smoke: while paused" not in subjects(await s.mirrors()), "synced while paused"
+        source = await source_status("alice@contoso.example")
+        wrong = await s.oauth(alice, source["reauth_url"], "bob@contoso.example")
+        assert "status=error" in wrong, wrong
+        landed = await s.oauth(alice, source["reauth_url"], "alice@contoso.example")
+        assert "status=reconnected" in landed, landed
+        took = await s.wait_for(lambda m: "[Contoso] Smoke: while paused" in subjects(m), timeout=30)
+        assert (await source_status("alice@contoso.example"))["status"] == "active"
+        return f"wrong account rejected; change made while paused mirrored {took:.1f}s after reconnect"
 
     async def unlink() -> str:
         sources = (await alice.get(f"{web}/api/sources")).json()
-        fab = next(x for x in sources if x["source_email"] == "alice@fabrikam.example")
-        assert (await alice.delete(f"{web}/api/sources/{fab['id']}")).status_code == 202
+        for source in sources:
+            assert (await alice.delete(f"{web}/api/sources/{source['id']}")).status_code == 202
         took = await s.wait_for(lambda m: not m)
         return f"all mirrors removed in {took:.1f}s"
 
@@ -258,9 +284,8 @@ async def main(web: str, mock: str) -> int:
         )
 
     await s.check("operator signs in", operator_signs_in)
-    await s.check("onboard Contoso (admin consent)", await onboard("Contoso"))
-    await s.check("onboard Fabrikam (admin consent)", await onboard("Fabrikam"))
-    await s.check("Alice signs in and links two tenants", alice_signs_in_and_links)
+    await s.check("Alice signs in and links two tenants (user consent)", alice_signs_in_and_links)
+    await s.check("blocked user consent needs admin approval", admin_approval_required)
     await s.check("initial backfill mirrored", backfill)
     await s.check("created event is mirrored", create_event)
     await s.check("updated event is mirrored", update_event)
@@ -268,8 +293,9 @@ async def main(web: str, mock: str) -> int:
     await s.check("missed notifications recovered", missed_notifications)
     await s.check("throttled tenant recovers", throttled)
     await s.check("removed subscription is recreated", subscription_removed)
-    await s.check("tenant revocation removes its mirrors", revoke)
-    await s.check("unlinking removes remaining mirrors", unlink)
+    await s.check("revoked refresh token pauses the source", revoke)
+    await s.check("reconnecting resumes and catches up", reconnect)
+    await s.check("unlinking removes all mirrors", unlink)
     await s.check("operator health overview", health)
 
     await operator.aclose()

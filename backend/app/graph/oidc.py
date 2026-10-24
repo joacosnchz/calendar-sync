@@ -1,4 +1,11 @@
-"""Delegated OpenID Connect sign-in (proof of mailbox ownership) and admin consent links."""
+"""Delegated OpenID Connect sign-in.
+
+Platform sign-in only proves who the user is (openid profile email User.Read). Linking a
+source calendar (and reconnecting one) asks the mailbox owner for delegated
+Calendars.Read plus offline_access (incremental consent), which every user can grant for
+themselves: no tenant admin is involved. The resulting refresh token is stored per
+source and used by the workers (see app.graph.tokens).
+"""
 
 from dataclasses import dataclass
 from urllib.parse import urlencode
@@ -10,6 +17,12 @@ from app.config import Settings
 from app.graph.tokens import App, credentials_for
 
 SIGN_IN_SCOPES = "openid profile email User.Read"
+LINK_SCOPES = "openid profile email offline_access User.Read Calendars.Read"
+REQUIRED_SOURCE_SCOPE = "calendars.read"
+
+# Authorize-endpoint errors meaning the tenant doesn't let users consent for themselves
+# (an admin has to approve the app, or user consent is disabled).
+ADMIN_APPROVAL_CODES = ("AADSTS90094", "AADSTS90008")
 
 
 class OidcError(Exception):
@@ -24,54 +37,94 @@ class SignedInIdentity:
     name: str
 
 
-def authorize_url(settings: Settings, *, state: str, nonce: str, prompt: str = "select_account") -> str:
+@dataclass(frozen=True)
+class CodeExchange:
+    identity: SignedInIdentity
+    access_token: str | None
+    expires_in: int
+    refresh_token: str | None
+    scope: str
+
+    @property
+    def can_read_calendars(self) -> bool:
+        granted = {s.rsplit("/", 1)[-1].lower() for s in self.scope.split()}
+        return REQUIRED_SOURCE_SCOPE in granted
+
+
+def needs_admin_approval(error: str | None, description: str | None) -> bool:
+    description = description or ""
+    if any(code in description for code in ADMIN_APPROVAL_CODES):
+        return True
+    if "AADSTS65001" in description and "admin" in description.lower():
+        return True
+    return error == "consent_required"
+
+
+def authorize_url(
+    settings: Settings,
+    *,
+    state: str,
+    nonce: str,
+    scopes: str = SIGN_IN_SCOPES,
+    tenant: str = "organizations",
+    login_hint: str | None = None,
+    prompt: str | None = "select_account",
+) -> str:
     # Work and school accounts only; the token's `tid` tells us which tenant.
-    query = urlencode(
-        {
-            "client_id": settings.source_app_client_id,
-            "response_type": "code",
-            "redirect_uri": settings.oauth_redirect_uri,
-            "response_mode": "query",
-            "scope": SIGN_IN_SCOPES,
-            "state": state,
-            "nonce": nonce,
-            "prompt": prompt,
-        }
-    )
-    return f"{settings.browser_login_base_url}/organizations/oauth2/v2.0/authorize?{query}"
-
-
-def admin_consent_url(settings: Settings, *, tenant: str, state: str) -> str:
-    query = urlencode(
-        {
-            "client_id": settings.source_app_client_id,
-            "redirect_uri": settings.admin_consent_redirect_uri,
-            "state": state,
-        }
-    )
-    return f"{settings.browser_login_base_url}/{tenant}/adminconsent?{query}"
+    params = {
+        "client_id": settings.source_app_client_id,
+        "response_type": "code",
+        "redirect_uri": settings.oauth_redirect_uri,
+        "response_mode": "query",
+        "scope": scopes,
+        "state": state,
+        "nonce": nonce,
+    }
+    if prompt:
+        params["prompt"] = prompt
+    if login_hint:
+        params["login_hint"] = login_hint
+    return f"{settings.browser_login_base_url}/{tenant}/oauth2/v2.0/authorize?{urlencode(params)}"
 
 
 async def exchange_code(
-    http: httpx.AsyncClient, settings: Settings, *, code: str, nonce: str
-) -> SignedInIdentity:
-    token_url = f"{settings.login_base_url.rstrip('/')}/organizations/oauth2/v2.0/token"
+    http: httpx.AsyncClient,
+    settings: Settings,
+    *,
+    code: str,
+    nonce: str,
+    scopes: str = SIGN_IN_SCOPES,
+    tenant: str = "organizations",
+) -> CodeExchange:
+    token_url = f"{settings.login_base_url.rstrip('/')}/{tenant}/oauth2/v2.0/token"
     creds = credentials_for(settings, App.SOURCE)
-    resp = await http.post(
-        token_url,
-        data={
-            "grant_type": "authorization_code",
-            "client_id": creds.client_id,
-            "code": code,
-            "redirect_uri": settings.oauth_redirect_uri,
-            "scope": SIGN_IN_SCOPES,
-            **creds.form(token_url),
-        },
-    )
-    body = resp.json() if resp.content else {}
+    try:
+        resp = await http.post(
+            token_url,
+            data={
+                "grant_type": "authorization_code",
+                "client_id": creds.client_id,
+                "code": code,
+                "redirect_uri": settings.oauth_redirect_uri,
+                "scope": scopes,
+                **creds.form(token_url),
+            },
+        )
+    except httpx.TransportError as exc:
+        raise OidcError("Microsoft sign-in is unreachable, try again") from exc
+    try:
+        body = resp.json() if resp.content else {}
+    except ValueError:
+        body = {}
     if resp.status_code != 200 or "id_token" not in body:
         raise OidcError(body.get("error_description") or f"Token exchange failed ({resp.status_code})")
-    return validate_id_token(body["id_token"], settings, nonce=nonce)
+    return CodeExchange(
+        identity=validate_id_token(body["id_token"], settings, nonce=nonce),
+        access_token=body.get("access_token"),
+        expires_in=int(body.get("expires_in", 3600)),
+        refresh_token=body.get("refresh_token"),
+        scope=body.get("scope", ""),
+    )
 
 
 def validate_id_token(id_token: str, settings: Settings, *, nonce: str) -> SignedInIdentity:

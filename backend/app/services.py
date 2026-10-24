@@ -44,11 +44,12 @@ class Services:
             timeout=httpx.Timeout(30.0, connect=10.0),
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
         )
-        tokens = TokenService(http, redis, settings)
+        sessionmaker = create_sessionmaker(engine)
+        tokens = TokenService(http, redis, settings, sessionmaker)
         return cls(
             settings=settings,
             engine=engine,
-            sessionmaker=create_sessionmaker(engine),
+            sessionmaker=sessionmaker,
             redis=redis,
             http=http,
             tokens=tokens,

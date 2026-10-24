@@ -3,7 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { api, ApiError, type Me } from "./api";
+import { api, type Me } from "./api";
 
 export interface Resource<T> {
   data: T | undefined;
@@ -12,8 +12,15 @@ export interface Resource<T> {
   reload: () => Promise<void>;
 }
 
-/** Fetch JSON, optionally polling. Keeps showing the last data while refreshing. */
-export function useResource<T>(path: string | null, pollMs?: number): Resource<T> {
+/**
+ * Fetch JSON, optionally polling. Keeps showing the last data while refreshing.
+ * A 401 sends the browser to sign in again unless `anonymous` is set (see api()).
+ */
+export function useResource<T>(
+  path: string | null,
+  pollMs?: number,
+  { anonymous = false }: { anonymous?: boolean } = {},
+): Resource<T> {
   const [data, setData] = useState<T>();
   const [error, setError] = useState<Error>();
   const [loading, setLoading] = useState(path !== null);
@@ -23,7 +30,7 @@ export function useResource<T>(path: string | null, pollMs?: number): Resource<T
   const reload = useCallback(async () => {
     if (!path) return;
     try {
-      const result = await api<T>(path);
+      const result = await api<T>(path, { anonymous });
       if (current.current === path) {
         setData(result);
         setError(undefined);
@@ -33,7 +40,7 @@ export function useResource<T>(path: string | null, pollMs?: number): Resource<T
     } finally {
       if (current.current === path) setLoading(false);
     }
-  }, [path]);
+  }, [path, anonymous]);
 
   useEffect(() => {
     current.current = path;
@@ -50,17 +57,15 @@ export function useResource<T>(path: string | null, pollMs?: number): Resource<T
   return { data, error, loading, reload };
 }
 
-/** The signed-in user; sends anonymous visitors to the landing page. */
+/** The signed-in user. Without a session, api() sends the browser to sign in and back. */
 export function useMe(options: { requireOperator?: boolean } = {}) {
   const router = useRouter();
   const me = useResource<Me>("/api/me");
-  const unauthorized = me.error instanceof ApiError && me.error.status === 401;
   const forbidden = options.requireOperator && me.data && !me.data.is_operator;
 
   useEffect(() => {
-    if (unauthorized) router.replace("/");
-    else if (forbidden) router.replace("/dashboard");
-  }, [unauthorized, forbidden, router]);
+    if (forbidden) router.replace("/dashboard");
+  }, [forbidden, router]);
 
   return me;
 }

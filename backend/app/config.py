@@ -29,7 +29,10 @@ class Settings(BaseSettings):
     login_browser_base_url: str | None = None
     graph_base_url: str = "https://graph.microsoft.com/v1.0"
 
-    # Multi-tenant app customers consent to: Calendars.Read (application).
+    # Multi-tenant app users sign in with. Delegated permissions only (openid, profile,
+    # email, offline_access, User.Read, Calendars.Read), each user consents for their own
+    # mailbox; no application permissions and no admin consent. Confidential client: a
+    # secret or (preferred) a certificate. Redirect URI: {public_web_url}/auth/callback.
     source_app_client_id: str
     source_app_client_secret: str | None = None
     source_app_cert_path: str | None = None
@@ -81,10 +84,6 @@ class Settings(BaseSettings):
     @property
     def oauth_redirect_uri(self) -> str:
         return f"{self.public_web_url.rstrip('/')}/auth/callback"
-
-    @property
-    def admin_consent_redirect_uri(self) -> str:
-        return f"{self.public_web_url.rstrip('/')}/auth/adminconsent/callback"
 
     @property
     def cookies_secure(self) -> bool:

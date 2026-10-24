@@ -1,4 +1,4 @@
-"""Linking, unlinking and revocation of sources and tenants; primary calendar provisioning."""
+"""Source lifecycle (setup, reauth_required, unlink) and primary calendar provisioning."""
 
 import logging
 import uuid
@@ -9,13 +9,12 @@ from sqlalchemy.orm import selectinload
 from app.audit import audit
 from app.graph.client import GraphError, GraphNotFound
 from app.models import (
-    ConsentStatus,
     LinkedSource,
     MirrorMapping,
     PrimaryStatus,
     SourceEvent,
     SourceStatus,
-    Tenant,
+    SyncError,
     User,
 )
 from app.queue import sync_key
@@ -31,35 +30,72 @@ log = logging.getLogger(__name__)
 # --- sources -------------------------------------------------------------------------
 
 
-async def setup_source(services: Services, source_id: uuid.UUID) -> str:
-    """Start syncing a newly linked (or re-activated) source: subscribe, then backfill."""
+async def setup_source(services: Services, source_id: uuid.UUID, mode: SyncMode = SyncMode.INITIAL) -> str:
+    """Start syncing a newly linked or reconnected source: subscribe, then sync.
+
+    INITIAL backfills a new link; RECOVERY (after a reconnect) continues from the stored
+    delta link, which picks up everything that changed while the source was paused.
+    """
     async with services.sessionmaker() as session:
-        source = await session.get(LinkedSource, source_id, options=[selectinload(LinkedSource.tenant)])
+        source = await session.get(LinkedSource, source_id)
         if source is None:
             return "gone"
-        if source.tenant.consent_status != ConsentStatus.CONNECTED:
-            source.status = SourceStatus.PENDING_CONSENT
-            await session.commit()
-            return "pending-consent"
         if source.status != SourceStatus.ACTIVE:
             return f"skipped-{source.status}"
 
-    # Subscribe first, then backfill: a change made in between is caught by the delta.
+    # Subscribe first, then sync: a change made in between is caught by the delta.
+    # create_subscription replaces a subscription left over from a previous grant.
     await create_subscription(services, source_id)
     await services.queue.enqueue_coalesced(
-        sync_key(source_id, SyncMode.INITIAL), "sync_source", str(source_id), SyncMode.INITIAL.value
+        sync_key(source_id, mode), "sync_source", str(source_id), mode.value
     )
     return "subscribed"
 
 
-async def purge_source(
-    services: Services, source_id: uuid.UUID, *, final_status: str | None, reason: str
-) -> str:
-    """Stop syncing a source and remove its mirrors (FR-12).
+async def mark_reauth_required(services: Services, source_id: uuid.UUID, reason: str) -> str:
+    """The source's delegated grant stopped working (refresh token expired or revoked, MFA
+    or consent now required, password reset...). Pause syncing until the owner signs in
+    again. Mirrors, stored events and the subscription row are kept on purpose."""
+    async with services.sessionmaker() as session:
+        source = await session.get(LinkedSource, source_id)
+        if source is None:
+            return "gone"
+        if source.status == SourceStatus.REMOVING:
+            return "removing"
+        now = utcnow()
+        first = source.status != SourceStatus.REAUTH_REQUIRED
+        source.status = SourceStatus.REAUTH_REQUIRED
+        source.last_error = reason[:2000]
+        source.last_error_at = now
+        if first:
+            source.reauth_required_at = now
+            audit(
+                session,
+                "source.reauth_required",
+                "linked_source",
+                source.id,
+                email=source.source_email,
+                reason=reason[:500],
+            )
+            session.add(
+                SyncError(
+                    user_id=source.user_id,
+                    tenant_pk=source.tenant_pk,
+                    source_id=source.id,
+                    kind="source.reauth_required",
+                    message=reason[:4000],
+                )
+            )
+        await session.commit()
+    await services.tokens.invalidate_source(source_id)
+    if first:
+        log.warning("source %s needs the user to reconnect: %s", source_id, reason)
+    return "reauth-required"
 
-    final_status=None deletes the link (user unlinked); otherwise the link is kept with
-    that status so the user can see why it stopped (e.g. tenant revoked).
-    """
+
+async def purge_source(services: Services, source_id: uuid.UUID, *, reason: str) -> str:
+    """Unlink: stop syncing a source, remove its mirrors (FR-12) and delete the link,
+    including its stored refresh token."""
     async with services.sessionmaker() as session:
         source = await session.get(
             LinkedSource,
@@ -71,13 +107,14 @@ async def purge_source(
         tenant_id = source.tenant.tenant_id
         user_id = source.user_id
         # Exclude it from every mirror group immediately.
-        source.status = final_status or SourceStatus.REMOVING
+        source.status = SourceStatus.REMOVING
         await session.commit()
 
         if source.subscription is not None:
             if tenant_id:
+                # Best effort, with the source's own token (fails harmlessly if revoked).
                 await delete_remote_subscription(
-                    services, tenant_id, source.subscription.graph_subscription_id
+                    services, source.id, tenant_id, source.subscription.graph_subscription_id
                 )
             await session.delete(source.subscription)
 
@@ -90,81 +127,14 @@ async def purge_source(
                 )
             ).all()
         )
-        source.delta_link = None
-        source.delta_window_start = source.delta_window_end = None
-        if final_status is None:
-            await session.delete(source)
+        source.refresh_token = None
+        await session.delete(source)
         audit(session, "source.purged", "linked_source", source_id, reason=reason, mirrors=len(keys))
         await session.commit()
 
+    await services.tokens.invalidate_source(source_id)
     await enqueue_reconciles(services, user_id, keys)
     return f"purged mirrors={len(keys)}"
-
-
-# --- tenants -------------------------------------------------------------------------
-
-
-async def revoke_tenant(services: Services, tenant_pk: uuid.UUID, reason: str) -> str:
-    async with services.sessionmaker() as session:
-        tenant = await session.get(Tenant, tenant_pk)
-        if tenant is None:
-            return "gone"
-        if tenant.consent_status != ConsentStatus.REVOKED:
-            tenant.consent_status = ConsentStatus.REVOKED
-            tenant.revoked_at = utcnow()
-        tenant.last_error = reason
-        audit(session, "tenant.revoked", "tenant", tenant.id, reason=reason)
-        source_ids = list(
-            (
-                await session.scalars(
-                    select(LinkedSource.id).where(
-                        LinkedSource.tenant_pk == tenant_pk,
-                        LinkedSource.status.in_(
-                            [SourceStatus.ACTIVE, SourceStatus.PENDING_CONSENT, SourceStatus.ERROR]
-                        ),
-                    )
-                )
-            ).all()
-        )
-        tenant_id = tenant.tenant_id
-        await session.commit()
-
-    if tenant_id:
-        from app.graph.tokens import App
-
-        await services.tokens.invalidate(App.SOURCE, tenant_id)
-    for source_id in source_ids:
-        await purge_source(services, source_id, final_status=SourceStatus.REVOKED, reason=reason)
-    return f"revoked sources={len(source_ids)}"
-
-
-async def revoke_tenant_by_entra_id(services: Services, tenant_id: str, reason: str) -> str:
-    async with services.sessionmaker() as session:
-        tenant_pk = await session.scalar(select(Tenant.id).where(Tenant.tenant_id == tenant_id))
-    if tenant_pk is None:
-        return "unknown-tenant"
-    return await revoke_tenant(services, tenant_pk, reason)
-
-
-async def activate_tenant_sources(services: Services, tenant_pk: uuid.UUID) -> int:
-    """After admin consent, start every link that was waiting on it."""
-    async with services.sessionmaker() as session:
-        sources = (
-            await session.scalars(
-                select(LinkedSource).where(
-                    LinkedSource.tenant_pk == tenant_pk,
-                    LinkedSource.status.in_([SourceStatus.PENDING_CONSENT, SourceStatus.REVOKED]),
-                )
-            )
-        ).all()
-        for source in sources:
-            source.status = SourceStatus.ACTIVE
-            source.last_error = None
-        ids = [s.id for s in sources]
-        await session.commit()
-    for source_id in ids:
-        await services.queue.enqueue("setup_source", str(source_id))
-    return len(ids)
 
 
 # --- primary calendars ---------------------------------------------------------------
@@ -241,9 +211,11 @@ async def delete_user(services: Services, user_id: uuid.UUID) -> str:
             source.status = SourceStatus.REMOVING
             if source.subscription is not None and source.tenant.tenant_id:
                 await delete_remote_subscription(
-                    services, source.tenant.tenant_id, source.subscription.graph_subscription_id
+                    services, source.id, source.tenant.tenant_id, source.subscription.graph_subscription_id
                 )
         await session.commit()
+        for source in sources:
+            await services.tokens.invalidate_source(source.id)
 
         # Deleted progressively so a throttled retry resumes where it left off.
         mappings = (

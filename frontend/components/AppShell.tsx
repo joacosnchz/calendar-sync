@@ -1,10 +1,11 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
+import { usePathname } from "next/navigation";
 
-import { post, type Me } from "@/lib/api";
-import { useMe } from "@/lib/hooks";
+import { navigate, post, type Me, type Source } from "@/lib/api";
+import { reauthSummary } from "@/lib/format";
+import { useMe, useResource } from "@/lib/hooks";
 
 import { cx, Spinner } from "./ui";
 
@@ -35,8 +36,10 @@ export function AppShell({
   requireOperator?: boolean;
 }) {
   const pathname = usePathname();
-  const router = useRouter();
   const me = useMe({ requireOperator });
+  // Only for the "needs sign-in" dot on Accounts; the dashboard polls sources itself.
+  const sources = useResource<Source[]>(me.data ? "/api/sources" : null, 60_000);
+  const reauthCount = sources.data?.filter((s) => s.status === "reauth_required").length ?? 0;
 
   if (!me.data || (requireOperator && !me.data.is_operator)) {
     return (
@@ -68,6 +71,14 @@ export function AppShell({
                 )}
               >
                 {item.label}
+                {item.href === "/dashboard" && reauthCount > 0 && (
+                  <span
+                    className="ml-1.5 inline-block h-2 w-2 rounded-full bg-amber-500 align-middle"
+                    title={reauthSummary(reauthCount)}
+                  >
+                    <span className="sr-only">(sign-in needed)</span>
+                  </span>
+                )}
               </Link>
             ))}
           </nav>
@@ -77,7 +88,7 @@ export function AppShell({
               className="rounded-md px-2 py-1 text-slate-600 hover:bg-slate-100"
               onClick={async () => {
                 await post("/auth/logout");
-                router.replace("/");
+                navigate("/");
               }}
             >
               Sign out

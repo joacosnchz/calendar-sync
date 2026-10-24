@@ -38,19 +38,17 @@ class TimestampMixin:
 # --- status vocabularies -------------------------------------------------------------
 
 
-class ConsentStatus:
-    PENDING = "pending"  # consent link generated, admin hasn't approved yet
-    CONNECTED = "connected"
-    DENIED = "denied"
-    REVOKED = "revoked"
-
-
 class SourceStatus:
-    PENDING_CONSENT = "pending_consent"  # ownership proven, waiting for tenant admin consent
     ACTIVE = "active"
+    # The delegated grant stopped working (refresh token expired or revoked, MFA or
+    # consent now required, password reset...). Syncing is paused and existing mirrors
+    # are kept until the user signs in again (Reconnect).
+    REAUTH_REQUIRED = "reauth_required"
     REMOVING = "removing"
-    REVOKED = "revoked"  # tenant revoked consent; mirrors removed
     ERROR = "error"
+
+    # Sources whose stored events still back mirrors in the primary calendar.
+    MIRRORED = (ACTIVE, REAUTH_REQUIRED)
 
 
 class PrimaryStatus:
@@ -93,15 +91,12 @@ class Tenant(TimestampMixin, Base):
     __tablename__ = "tenants"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=_uuid)
-    # Entra ID tenant GUID; unknown until an admin consents or a user signs in from it.
+    # Entra ID tenant GUID. Recorded the first time a user links a mailbox from it.
     tenant_id: Mapped[str | None] = mapped_column(String(64), unique=True)
     display_name: Mapped[str] = mapped_column(String(256))
     domain: Mapped[str | None] = mapped_column(String(256))
-    consent_status: Mapped[str] = mapped_column(String(32), default=ConsentStatus.PENDING)
     # Per-customer privacy control: when false, mirrors show "Busy" with no subject/location.
     copy_details: Mapped[bool] = mapped_column(Boolean, default=True)
-    connected_at: Mapped[datetime | None]
-    revoked_at: Mapped[datetime | None]
     last_error: Mapped[str | None] = mapped_column(Text)
 
     sources: Mapped[list["LinkedSource"]] = relationship(back_populates="tenant", passive_deletes=True)
@@ -119,6 +114,12 @@ class LinkedSource(TimestampMixin, Base):
     calendar_id: Mapped[str | None] = mapped_column(Text)  # None = the mailbox's default calendar
     label: Mapped[str] = mapped_column(String(128))
     status: Mapped[str] = mapped_column(String(32), default=SourceStatus.ACTIVE, index=True)
+
+    # Delegated access (Calendars.Read + offline_access) granted by the mailbox owner.
+    # Rotated by Entra on use; the newest one is always stored.
+    refresh_token: Mapped[str | None] = mapped_column(EncryptedText)
+    granted_scopes: Mapped[str | None] = mapped_column(Text)
+    reauth_required_at: Mapped[datetime | None]
 
     delta_link: Mapped[str | None] = mapped_column(Text)
     delta_window_start: Mapped[datetime | None]

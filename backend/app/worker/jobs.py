@@ -1,5 +1,5 @@
 """arq job functions. Each one is a thin wrapper around app.sync.* run through `run_job`,
-which centralises coalescing, throttling, retries, revocation and error recording."""
+which centralises coalescing, throttling, retries, reauth detection and error recording."""
 
 import logging
 import random
@@ -94,16 +94,24 @@ async def run_job(
         THROTTLED.labels(exc.scope.split(":", 1)[0]).inc()
         return await retry(exc.retry_after + random.uniform(0, 2))
     except TokenError as exc:
-        if exc.revoked and exc.tenant_id:
-            log.warning("tenant %s revoked access (%s)", exc.tenant_id, exc.code)
-            await services.queue.enqueue("revoke_tenant_by_entra_id", exc.tenant_id, f"{exc.code}: {exc}")
-            return "tenant-revoked"
+        reauth_source = exc.source_id or source_id
+        if exc.reauth_required and reauth_source:
+            # Only the user can fix this (sign in again): pause the source, keep mirrors.
+            await lifecycle.mark_reauth_required(services, reauth_source, _reauth_reason(exc))
+            return "reauth-required"
         if exc.transient:
             return await retry(_backoff(job_try))
         await record_error(services, f"{name}:token", exc, source_id=source_id, user_id=user_id)
         JOB_FAILURES.labels(name).inc()
         raise
     except (httpx.TransportError, GraphError) as exc:
+        if isinstance(exc, GraphError) and exc.auth_failure and exc.source_id:
+            # 401 even after refreshing the delegated token, or 403 on the user's own
+            # mailbox: the grant no longer covers it. Only signing in again fixes that.
+            await lifecycle.mark_reauth_required(
+                services, exc.source_id, f"Microsoft Graph refused access ({exc.status}): {exc.message}"
+            )
+            return "reauth-required"
         transient = isinstance(exc, httpx.TransportError) or (isinstance(exc, GraphError) and exc.transient)
         if transient and job_try < MAX_TRIES:
             return await retry(_backoff(job_try))
@@ -116,6 +124,12 @@ async def run_job(
         await record_error(services, name, exc, source_id=source_id, user_id=user_id)
         JOB_FAILURES.labels(name).inc()
         raise
+
+
+def _reauth_reason(exc: TokenError) -> str:
+    detail = str(exc).split("\r\n")[0].split("\n")[0]
+    code = f" ({exc.code})" if exc.code and exc.code not in detail else ""
+    return f"Sign in again to reconnect this calendar. Microsoft said: {detail}{code}"
 
 
 # --- event jobs ----------------------------------------------------------------------
@@ -176,9 +190,11 @@ async def rebuild_user(ctx: dict, user_id: str) -> Any:
 # --- subscription jobs ---------------------------------------------------------------
 
 
-async def setup_source(ctx: dict, source_id: str) -> Any:
+async def setup_source(ctx: dict, source_id: str, mode: str = SyncMode.INITIAL.value) -> Any:
     sid = uuid.UUID(source_id)
-    return await run_job(ctx, "setup_source", lambda s: lifecycle.setup_source(s, sid), source_id=sid)
+    return await run_job(
+        ctx, "setup_source", lambda s: lifecycle.setup_source(s, sid, SyncMode(mode)), source_id=sid
+    )
 
 
 async def ensure_subscription(ctx: dict, source_id: str) -> Any:
@@ -215,30 +231,12 @@ async def handle_lifecycle(ctx: dict, graph_subscription_id: str, event: str) ->
     )
 
 
-# --- source / tenant / user lifecycle ------------------------------------------------
+# --- source / user lifecycle ---------------------------------------------------------
 
 
 async def remove_source(ctx: dict, source_id: str, reason: str = "unlinked") -> Any:
     sid = uuid.UUID(source_id)
-    return await run_job(
-        ctx, "remove_source", lambda s: lifecycle.purge_source(s, sid, final_status=None, reason=reason)
-    )
-
-
-async def revoke_tenant(ctx: dict, tenant_pk: str, reason: str) -> Any:
-    pk = uuid.UUID(tenant_pk)
-    return await run_job(ctx, "revoke_tenant", lambda s: lifecycle.revoke_tenant(s, pk, reason))
-
-
-async def revoke_tenant_by_entra_id(ctx: dict, tenant_id: str, reason: str) -> Any:
-    return await run_job(
-        ctx, "revoke_tenant", lambda s: lifecycle.revoke_tenant_by_entra_id(s, tenant_id, reason)
-    )
-
-
-async def activate_tenant(ctx: dict, tenant_pk: str) -> Any:
-    pk = uuid.UUID(tenant_pk)
-    return await run_job(ctx, "activate_tenant", lambda s: lifecycle.activate_tenant_sources(s, pk))
+    return await run_job(ctx, "remove_source", lambda s: lifecycle.purge_source(s, sid, reason=reason))
 
 
 async def provision_primary(ctx: dict, user_id: str) -> Any:
@@ -261,9 +259,6 @@ JOB_FUNCTIONS = [
     renew_subscription,
     handle_lifecycle,
     remove_source,
-    revoke_tenant,
-    revoke_tenant_by_entra_id,
-    activate_tenant,
     provision_primary,
     delete_user,
 ]

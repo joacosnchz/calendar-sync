@@ -49,25 +49,26 @@ def new_nonce() -> str:
 
 
 def issue_oauth_state(
-    settings: Settings, *, purpose: str, nonce: str, user_id: uuid.UUID | None = None, next_path: str = "/"
+    settings: Settings,
+    *,
+    purpose: str,
+    nonce: str,
+    user_id: uuid.UUID | None = None,
+    next_path: str = "/",
+    source_id: uuid.UUID | None = None,
 ) -> str:
+    """purpose: "login" (platform sign-in), "link" (add a source) or "reauth" (reconnect
+    the source `source_id`)."""
     claims = {"typ": "oauth", "purpose": purpose, "nonce": nonce, "next": next_path}
     if user_id:
         claims["uid"] = str(user_id)
+    if source_id:
+        claims["sid"] = str(source_id)
     return _encode(settings, claims, timedelta(minutes=15))
 
 
 def read_oauth_state(settings: Settings, token: str) -> dict[str, Any]:
     return _decode(settings, token, "oauth")
-
-
-def issue_consent_state(settings: Settings, tenant_pk: uuid.UUID) -> str:
-    # Consent links are sent to customer admins, who may take a while to act on them.
-    return _encode(settings, {"typ": "consent", "tenant": str(tenant_pk)}, timedelta(days=30))
-
-
-def read_consent_state(settings: Settings, token: str) -> uuid.UUID:
-    return uuid.UUID(_decode(settings, token, "consent")["tenant"])
 
 
 def safe_next_path(value: str | None) -> str:

@@ -1,17 +1,34 @@
-"""Sign-in, source account linking (FR-3) and tenant admin consent (FR-1)."""
+"""Sign-in, source account linking (FR-3) and reconnecting a source after its delegated
+grant stopped working.
+
+Every flow is a delegated OIDC round trip against the user's own tenant. Linking and
+reconnecting request Calendars.Read + offline_access, which each user consents to for
+their own mailbox; the refresh token that comes back is stored (encrypted) on the source.
+"""
 
 import logging
+import uuid
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import RedirectResponse, Response
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.api.deps import current_user, get_services, get_session
 from app.audit import audit
-from app.graph.oidc import OidcError, SignedInIdentity, authorize_url, exchange_code
-from app.models import ConsentStatus, LinkedSource, PrimaryStatus, SourceStatus, Tenant, User
+from app.graph.oidc import (
+    LINK_SCOPES,
+    SIGN_IN_SCOPES,
+    CodeExchange,
+    OidcError,
+    SignedInIdentity,
+    authorize_url,
+    exchange_code,
+    needs_admin_approval,
+)
+from app.models import LinkedSource, PrimaryStatus, SourceStatus, Tenant, User
 from app.security import (
     OAUTH_COOKIE,
     SESSION_COOKIE,
@@ -19,16 +36,17 @@ from app.security import (
     issue_oauth_state,
     issue_session,
     new_nonce,
-    read_consent_state,
     read_oauth_state,
     read_session,
     safe_next_path,
 )
 from app.services import Services
-from app.timeutil import utcnow
+from app.sync.source_sync import SyncMode
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+RESULT_PATH = "/link/result"
 
 
 def _web(services: Services, path: str, **params: str) -> str:
@@ -36,18 +54,48 @@ def _web(services: Services, path: str, **params: str) -> str:
     return f"{services.settings.public_web_url.rstrip('/')}{path}{query}"
 
 
+def _result(services: Services, status: str, **params: str) -> Response:
+    return RedirectResponse(_web(services, RESULT_PATH, status=status, **params), status_code=302)
+
+
+def _error(services: Services, message: str) -> Response:
+    return _result(services, "error", message=message)
+
+
 def _start(
-    services: Services, *, purpose: str, user: User | None = None, next_path: str = "/dashboard"
+    services: Services,
+    *,
+    purpose: str,
+    user: User | None = None,
+    next_path: str = "/dashboard",
+    source: LinkedSource | None = None,
 ) -> Response:
+    settings = services.settings
     nonce = new_nonce()
     state = issue_oauth_state(
-        services.settings,
+        settings,
         purpose=purpose,
         nonce=nonce,
         user_id=user.id if user else None,
         next_path=next_path,
+        source_id=source.id if source else None,
     )
-    resp = RedirectResponse(authorize_url(services.settings, state=state, nonce=nonce), status_code=302)
+    if purpose == "login":
+        url = authorize_url(settings, state=state, nonce=nonce, scopes=SIGN_IN_SCOPES)
+    elif source is not None:
+        # Reconnect: straight to the source's own tenant, pre-filled with its account.
+        url = authorize_url(
+            settings,
+            state=state,
+            nonce=nonce,
+            scopes=LINK_SCOPES,
+            tenant=source.tenant.tenant_id or "organizations",
+            login_hint=source.source_email,
+            prompt=None,
+        )
+    else:
+        url = authorize_url(settings, state=state, nonce=nonce, scopes=LINK_SCOPES)
+    resp = RedirectResponse(url, status_code=302)
     # Binds the OAuth round trip to this browser (login CSRF protection).
     resp.set_cookie(
         OAUTH_COOKIE,
@@ -55,7 +103,7 @@ def _start(
         max_age=900,
         httponly=True,
         samesite="lax",
-        secure=services.settings.cookies_secure,
+        secure=settings.cookies_secure,
         path="/auth",
     )
     return resp
@@ -69,6 +117,22 @@ async def login(next: str | None = None, services: Services = Depends(get_servic
 @router.get("/link")
 async def link(user: User = Depends(current_user), services: Services = Depends(get_services)) -> Response:
     return _start(services, purpose="link", user=user)
+
+
+@router.get("/reauth/{source_id}")
+async def reauth(
+    source_id: uuid.UUID,
+    user: User = Depends(current_user),
+    services: Services = Depends(get_services),
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    source = await session.get(LinkedSource, source_id, options=[selectinload(LinkedSource.tenant)])
+    # Isolation: only the owner can reconnect a source (and learns nothing about others).
+    if source is None or source.user_id != user.id:
+        return _error(services, "Calendar not found")
+    if source.status == SourceStatus.REMOVING:
+        return _error(services, "This calendar is being unlinked")
+    return _start(services, purpose="reauth", user=user, source=source)
 
 
 @router.post("/logout")
@@ -90,29 +154,52 @@ async def callback(
 ) -> Response:
     if error:
         log.info("sign-in error: %s %s", error, error_description)
-        return RedirectResponse(
-            _web(services, "/link/result", status="error", message=error_description or error)
-        )
+        if needs_admin_approval(error, error_description):
+            return _result(
+                services,
+                "admin_approval_required",
+                message=error_description
+                or "Your organization requires an administrator to approve Calendar Sync.",
+            )
+        return _error(services, error_description or error)
     try:
         claims = read_oauth_state(services.settings, state or "")
     except InvalidToken:
-        return RedirectResponse(
-            _web(services, "/link/result", status="error", message="Sign-in expired, try again")
-        )
+        return _error(services, "Sign-in expired, try again")
     nonce = request.cookies.get(OAUTH_COOKIE)
     if not nonce or nonce != claims["nonce"] or not code:
-        return RedirectResponse(
-            _web(services, "/link/result", status="error", message="Sign-in could not be verified")
-        )
-    try:
-        identity = await exchange_code(services.http, services.settings, code=code, nonce=nonce)
-    except OidcError as exc:
-        return RedirectResponse(_web(services, "/link/result", status="error", message=str(exc)))
+        return _error(services, "Sign-in could not be verified")
 
-    if claims["purpose"] == "login":
-        resp = await _complete_login(services, session, identity, claims.get("next", "/dashboard"))
+    purpose = claims["purpose"]
+    reauth_source: LinkedSource | None = None
+    if purpose == "reauth":
+        try:
+            source_id = uuid.UUID(claims.get("sid", ""))
+        except ValueError:
+            return _error(services, "Sign-in could not be verified")
+        reauth_source = await session.get(
+            LinkedSource, source_id, options=[selectinload(LinkedSource.tenant)]
+        )
+        if reauth_source is None:
+            return _error(services, "This calendar is no longer linked")
+    try:
+        result = await exchange_code(
+            services.http,
+            services.settings,
+            code=code,
+            nonce=nonce,
+            scopes=SIGN_IN_SCOPES if purpose == "login" else LINK_SCOPES,
+            tenant=(reauth_source.tenant.tenant_id if reauth_source else None) or "organizations",
+        )
+    except OidcError as exc:
+        return _error(services, str(exc))
+
+    if purpose == "login":
+        resp = await _complete_login(services, session, result.identity, claims.get("next", "/dashboard"))
+    elif purpose == "reauth" and reauth_source is not None:
+        resp = await _complete_reauth(request, services, session, result, claims.get("uid"), reauth_source)
     else:
-        resp = await _complete_link(request, services, session, identity, claims.get("uid"))
+        resp = await _complete_link(request, services, session, result, claims.get("uid"))
     resp.delete_cookie(OAUTH_COOKIE, path="/auth")
     return resp
 
@@ -162,37 +249,85 @@ async def _complete_login(
     return resp
 
 
+async def _session_user(
+    request: Request, services: Services, session: AsyncSession, state_uid: str | None
+) -> User | Response:
+    """The user who started linking/reconnecting must still be the one signed in."""
+    try:
+        session_uid = read_session(services.settings, request.cookies.get(SESSION_COOKIE, ""))
+    except InvalidToken:
+        return _error(services, "Please sign in again")
+    if str(session_uid) != state_uid:
+        return _error(services, "Session mismatch")
+    user = await session.get(User, session_uid)
+    if user is None:
+        return _error(services, "Unknown user")
+    return user
+
+
+def _grant_problem(result: CodeExchange) -> str | None:
+    if not result.can_read_calendars:
+        return "Calendar access wasn't granted. Try again and accept the permission request."
+    if not result.refresh_token:
+        return "Microsoft didn't grant offline access to your calendar. Try again."
+    return None
+
+
+async def _activate(
+    services: Services,
+    session: AsyncSession,
+    source: LinkedSource,
+    result: CodeExchange,
+    *,
+    user: User,
+    action: str,
+    mode: SyncMode,
+) -> None:
+    """Store the fresh delegated grant, (re)activate the source and start syncing it."""
+    source.source_email = result.identity.email
+    source.refresh_token = result.refresh_token
+    source.granted_scopes = result.scope
+    source.status = SourceStatus.ACTIVE
+    source.reauth_required_at = None
+    source.last_error = None
+    source.last_error_at = None
+    await session.flush()
+    audit(
+        session,
+        action,
+        "linked_source",
+        source.id,
+        actor=user,
+        email=result.identity.email,
+        tenant=source.tenant_pk,
+    )
+    await session.commit()
+    # Drop any access token minted from the previous grant; seed the new one.
+    await services.tokens.invalidate_source(source.id)
+    if result.access_token:
+        await services.tokens.cache_source_token(source.id, result.access_token, result.expires_in)
+    # Subscribe (replacing any subscription from the old grant), then sync.
+    await services.queue.enqueue("setup_source", str(source.id), mode.value)
+
+
 async def _complete_link(
     request: Request,
     services: Services,
     session: AsyncSession,
-    identity: SignedInIdentity,
+    result: CodeExchange,
     state_uid: str | None,
 ) -> Response:
     settings = services.settings
-    # The user who started linking must still be the one signed in to the platform.
-    try:
-        session_uid = read_session(settings, request.cookies.get(SESSION_COOKIE, ""))
-    except InvalidToken:
-        return RedirectResponse(
-            _web(services, "/link/result", status="error", message="Please sign in again")
-        )
-    if str(session_uid) != state_uid:
-        return RedirectResponse(_web(services, "/link/result", status="error", message="Session mismatch"))
-    user = await session.get(User, session_uid)
-    if user is None:
-        return RedirectResponse(_web(services, "/link/result", status="error", message="Unknown user"))
+    user = await _session_user(request, services, session, state_uid)
+    if isinstance(user, Response):
+        return user
+    identity = result.identity
 
     if identity.tenant_id == settings.home_tenant_id:
         # Primary calendars live in our tenant; linking it as a source would mirror mirrors.
-        return RedirectResponse(
-            _web(
-                services,
-                "/link/result",
-                status="error",
-                message="Accounts in the host tenant can't be linked",
-            )
-        )
+        return _error(services, "Accounts in the host tenant can't be linked")
+    if problem := _grant_problem(result):
+        return _error(services, problem)
 
     tenant = await session.scalar(select(Tenant).where(Tenant.tenant_id == identity.tenant_id))
     domain = identity.email.split("@")[-1]
@@ -202,7 +337,6 @@ async def _complete_link(
         await session.flush()
         audit(session, "tenant.discovered", "tenant", tenant.id, actor=user, tenant_id=identity.tenant_id)
 
-    connected = tenant.consent_status == ConsentStatus.CONNECTED
     # Proof of ownership: the user just signed in to this exact mailbox (FR-3).
     source = await session.scalar(
         select(LinkedSource).where(
@@ -220,112 +354,53 @@ async def _complete_link(
             label=tenant.display_name if tenant.display_name != domain else domain.split(".")[0].title(),
         )
         session.add(source)
-    elif source.status == SourceStatus.REMOVING:
-        return RedirectResponse(
-            _web(
-                services,
-                "/link/result",
-                status="error",
-                message="This account is still being unlinked, try again shortly",
-            )
+        await session.flush()
+        await _activate(
+            services, session, source, result, user=user, action="source.linked", mode=SyncMode.INITIAL
         )
-    source.source_email = identity.email
-    source.status = SourceStatus.ACTIVE if connected else SourceStatus.PENDING_CONSENT
-    source.last_error = None
-    await session.flush()
-    audit(
+        return _result(services, "linked", email=identity.email)
+
+    if source.status == SourceStatus.REMOVING:
+        return _error(services, "This account is still being unlinked, try again shortly")
+    reconnected = source.status == SourceStatus.REAUTH_REQUIRED
+    await _activate(
+        services,
         session,
-        "source.linked",
-        "linked_source",
-        source.id,
-        actor=user,
-        email=identity.email,
-        tenant=tenant.id,
+        source,
+        result,
+        user=user,
+        action="source.reconnected" if reconnected else "source.relinked",
+        mode=SyncMode.RECOVERY,
     )
-    await session.commit()
-
-    if not connected:
-        return RedirectResponse(
-            _web(
-                services,
-                "/link/result",
-                status="consent_required",
-                source=str(source.id),
-                email=identity.email,
-            )
-        )
-    await services.queue.enqueue("setup_source", str(source.id))
-    return RedirectResponse(_web(services, "/link/result", status="linked", email=identity.email))
+    return _result(services, "reconnected" if reconnected else "linked", email=identity.email)
 
 
-@router.get("/adminconsent/callback")
-async def admin_consent_callback(
-    state: str | None = None,
-    tenant: str | None = None,
-    admin_consent: str | None = None,
-    error: str | None = None,
-    error_description: str | None = None,
-    services: Services = Depends(get_services),
-    session: AsyncSession = Depends(get_session),
+async def _complete_reauth(
+    request: Request,
+    services: Services,
+    session: AsyncSession,
+    result: CodeExchange,
+    state_uid: str | None,
+    source: LinkedSource,
 ) -> Response:
-    try:
-        tenant_pk = read_consent_state(services.settings, state or "")
-    except InvalidToken:
-        return RedirectResponse(
-            _web(services, "/consent/result", status="error", message="Consent link expired")
+    user = await _session_user(request, services, session, state_uid)
+    if isinstance(user, Response):
+        return user
+    if source.user_id != user.id:
+        return _error(services, "This calendar is no longer linked")
+    if source.status == SourceStatus.REMOVING:
+        return _error(services, "This calendar is being unlinked")
+    identity = result.identity
+    if identity.tenant_id != source.tenant.tenant_id or identity.object_id != source.source_user_id:
+        log.info("reauth for source %s signed in as a different account", source.id)
+        return _error(
+            services,
+            f"You signed in as {identity.email}. "
+            f"Sign in as {source.source_email} to reconnect this calendar.",
         )
-    invite = await session.get(Tenant, tenant_pk)
-    if invite is None:
-        return RedirectResponse(
-            _web(services, "/consent/result", status="error", message="Unknown consent request")
-        )
-
-    if error or (admin_consent or "").lower() != "true" or not tenant:
-        invite.consent_status = ConsentStatus.DENIED
-        invite.last_error = error_description or error or "Consent not granted"
-        audit(session, "tenant.consent_denied", "tenant", invite.id, actor="graph", error=error)
-        await session.commit()
-        return RedirectResponse(
-            _web(services, "/consent/result", status="denied", message=error_description or error or "")
-        )
-
-    if tenant == services.settings.home_tenant_id:
-        return RedirectResponse(
-            _web(
-                services,
-                "/consent/result",
-                status="error",
-                message="The host tenant can't be a source tenant",
-            )
-        )
-
-    target = invite
-    existing = await session.scalar(select(Tenant).where(Tenant.tenant_id == tenant))
-    if existing is not None and existing.id != invite.id:
-        # A user from this tenant tried to link before consent; fold the invite into it.
-        await session.execute(
-            update(LinkedSource).where(LinkedSource.tenant_pk == invite.id).values(tenant_pk=existing.id)
-        )
-        if existing.display_name == existing.domain:
-            existing.display_name = invite.display_name
-        await session.delete(invite)
-        target = existing
-    elif invite.tenant_id and invite.tenant_id != tenant:
-        return RedirectResponse(
-            _web(
-                services,
-                "/consent/result",
-                status="error",
-                message="Consent came from a different tenant than expected",
-            )
-        )
-
-    target.tenant_id = tenant
-    target.consent_status = ConsentStatus.CONNECTED
-    target.connected_at = utcnow()
-    target.revoked_at = None
-    target.last_error = None
-    audit(session, "tenant.connected", "tenant", target.id, actor="graph", tenant_id=tenant)
-    await session.commit()
-    await services.queue.enqueue("activate_tenant", str(target.id))
-    return RedirectResponse(_web(services, "/consent/result", status="connected", tenant=target.display_name))
+    if problem := _grant_problem(result):
+        return _error(services, problem)
+    await _activate(
+        services, session, source, result, user=user, action="source.reconnected", mode=SyncMode.RECOVERY
+    )
+    return _result(services, "reconnected", email=identity.email)

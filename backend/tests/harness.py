@@ -19,7 +19,7 @@ from sqlalchemy import select
 from app.api.deps import CSRF_HEADER
 from app.api.main import create_app
 from app.config import Settings
-from app.models import Base, MirrorMapping, SourceEvent, User
+from app.models import Base, LinkedSource, MirrorMapping, SourceEvent, Subscription, User
 from app.queue import JobQueue
 from app.services import Services
 from app.worker.jobs import JOB_FUNCTIONS
@@ -140,13 +140,22 @@ class Harness:
 
     # -- flows ------------------------------------------------------------------------
 
+    async def authorize(self, location: str, upn: str) -> httpx.Response:
+        """Act as the mock's sign-in page: pick `upn` for the authorize URL `location`."""
+        url = urlparse(location)
+        assert url.hostname == "login.test", location
+        query = {k: v[0] for k, v in parse_qs(url.query).items()}
+        tenant_path = url.path.strip("/").split("/")[0]
+        user = self.mock.user_by_upn(upn)
+        async with self.mock_client() as mock:
+            return await mock.get(
+                "/mock/authorize/complete", params={**query, "oid": user.oid, "tenant_path": tenant_path}
+            )
+
     async def _oauth_roundtrip(self, browser: httpx.AsyncClient, start_path: str, upn: str) -> httpx.Response:
         start = await browser.get(start_path)
         assert start.status_code == 302, start.text
-        query = {k: v[0] for k, v in parse_qs(urlparse(start.headers["location"]).query).items()}
-        user = self.mock.user_by_upn(upn)
-        async with self.mock_client() as mock:
-            authorized = await mock.get("/mock/authorize/complete", params={**query, "oid": user.oid})
+        authorized = await self.authorize(start.headers["location"], upn)
         assert authorized.status_code == 302
         return await browser.get(authorized.headers["location"])
 
@@ -156,32 +165,20 @@ class Harness:
         assert resp.status_code == 302 and "cs_session" in resp.headers.get("set-cookie", ""), resp.text
         return browser
 
-    async def link(self, browser: httpx.AsyncClient, upn: str) -> dict[str, list[str]]:
-        resp = await self._oauth_roundtrip(browser, "/auth/link", upn)
-        assert resp.status_code == 307 or resp.status_code == 302, resp.text
-        return parse_qs(urlparse(resp.headers["location"]).query)
+    @staticmethod
+    def result_of(resp: httpx.Response) -> dict[str, str]:
+        assert resp.status_code in (302, 307), resp.text
+        location = resp.headers["location"]
+        assert location.startswith("http://web.test/link/result?"), location
+        return {k: v[0] for k, v in parse_qs(urlparse(location).query).items()}
 
-    async def onboard_tenant(self, operator: httpx.AsyncClient, domain: str, *, approve: bool = True) -> dict:
-        tenant = self.mock.find_tenant(domain)
-        assert tenant
-        created = await operator.post(
-            "/api/admin/tenants", json={"display_name": tenant.name, "domain": domain}
-        )
-        assert created.status_code == 201, created.text
-        return await self.consent(created.json()["consent_url"], tenant.tenant_id, approve=approve)
+    async def link(self, browser: httpx.AsyncClient, upn: str) -> dict[str, str]:
+        """Link (or re-link) a source by signing in as `upn`. Returns the result query."""
+        return self.result_of(await self._oauth_roundtrip(browser, "/auth/link", upn))
 
-    async def consent(self, consent_url: str, tenant_id: str, *, approve: bool = True) -> dict:
-        query = {k: v[0] for k, v in parse_qs(urlparse(consent_url).query).items()}
-        async with self.mock_client() as mock:
-            resp = await mock.post(
-                "/mock/adminconsent/complete",
-                data={**query, "tenant_id": tenant_id, "decision": "approve" if approve else "deny"},
-            )
-        assert resp.status_code == 303
-        async with self.client() as browser:
-            callback = await browser.get(resp.headers["location"])
-        assert callback.status_code in (302, 307)
-        return {k: v[0] for k, v in parse_qs(urlparse(callback.headers["location"]).query).items()}
+    async def reauth(self, browser: httpx.AsyncClient, source_id: Any, upn: str) -> dict[str, str]:
+        """Reconnect a source, signing in as `upn` on the source tenant's login page."""
+        return self.result_of(await self._oauth_roundtrip(browser, f"/auth/reauth/{source_id}", upn))
 
     # -- inspection -------------------------------------------------------------------
 
@@ -202,6 +199,16 @@ class Harness:
             user = await session.scalar(select(User).where(User.email == email))
             assert user
             return user
+
+    async def source(self, email: str) -> LinkedSource:
+        async with self.services.sessionmaker() as session:
+            source = await session.scalar(select(LinkedSource).where(LinkedSource.source_email == email))
+            assert source, email
+            return source
+
+    async def subscription_ids(self) -> list[str]:
+        async with self.services.sessionmaker() as session:
+            return list((await session.scalars(select(Subscription.graph_subscription_id))).all())
 
     async def source_event_count(self) -> int:
         async with self.services.sessionmaker() as session:

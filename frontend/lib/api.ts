@@ -14,8 +14,10 @@ export interface Source {
   id: string;
   label: string;
   source_email: string;
-  status: "pending_consent" | "active" | "removing" | "revoked" | "error";
-  tenant: { id: string; display_name: string; tenant_id: string | null; consent_status: string };
+  // reauth_required: the refresh token expired or was revoked. Mirrored events are kept,
+  // but syncing is paused until the user signs in again via reauth_url.
+  status: "active" | "reauth_required" | "removing" | "error";
+  tenant: { id: string; display_name: string; tenant_id: string | null };
   last_synced_at: string | null;
   last_full_sync_at: string | null;
   last_notification_at: string | null;
@@ -29,7 +31,8 @@ export interface Source {
     last_error: string | null;
   } | null;
   event_count: number;
-  consent_url: string | null;
+  reauth_url: string | null;
+  reauth_required_at: string | null;
   created_at: string;
 }
 
@@ -51,18 +54,15 @@ export interface Tenant {
   display_name: string;
   domain: string | null;
   tenant_id: string | null;
-  consent_status: "pending" | "connected" | "denied" | "revoked";
   copy_details: boolean;
-  connected_at: string | null;
-  revoked_at: string | null;
   last_error: string | null;
   created_at: string;
   source_count: number;
   active_source_count: number;
+  reauth_required_count: number;
   next_subscription_expiry: string | null;
   last_notification_at: string | null;
   errors_24h: number;
-  consent_url: string | null;
 }
 
 export interface AdminUser {
@@ -114,7 +114,7 @@ export interface AuditRow {
 
 export interface Overview {
   users: number;
-  tenants: Record<string, number>;
+  tenants: number;
   sources: Record<string, number>;
   subscriptions: number;
   subscriptions_expiring_24h: number;
@@ -132,12 +132,38 @@ export class ApiError extends Error {
   }
 }
 
-export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+// Set once we start a full-page navigation away (sign-in or sign-out), so late 401s from
+// requests still in flight don't trigger a second redirect.
+let leaving = false;
+
+/** Full-page navigation (OAuth flows, sign-out). Later 401s no longer redirect. */
+export function navigate(href: string) {
+  leaving = true;
+  window.location.assign(href);
+}
+
+/** The platform session expired: sign in again and come back to this page. */
+export function signInAgain() {
+  if (leaving) return;
+  navigate(`/auth/login?next=${encodeURIComponent(window.location.pathname + window.location.search)}`);
+}
+
+export interface ApiInit extends RequestInit {
+  /** Treat 401 as an ordinary error instead of redirecting to sign-in (e.g. the landing page). */
+  anonymous?: boolean;
+}
+
+export async function api<T>(path: string, { anonymous, ...init }: ApiInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   // Required by the backend on mutating requests (CSRF defence alongside SameSite cookies).
   headers.set("x-calsync-csrf", "1");
   if (init.body && !headers.has("content-type")) headers.set("content-type", "application/json");
   const res = await fetch(path, { ...init, headers, credentials: "same-origin", cache: "no-store" });
+  if (res.status === 401 && !anonymous) {
+    signInAgain();
+    // Never settles: the page is navigating away, so don't flash an error in the meantime.
+    return new Promise<T>(() => {});
+  }
   if (!res.ok) {
     let message = res.statusText;
     try {

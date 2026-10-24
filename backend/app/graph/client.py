@@ -1,6 +1,7 @@
 """Microsoft Graph client with per-scope throttling and a hard read-only guard for sources."""
 
 import logging
+import uuid
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -25,10 +26,18 @@ class GraphError(Exception):
         self.status = status
         self.code = code
         self.message = message
+        # Set when the call was made with a source's delegated token.
+        self.source_id: uuid.UUID | None = None
 
     @property
     def transient(self) -> bool:
         return self.status >= 500
+
+    @property
+    def auth_failure(self) -> bool:
+        """401 even with a freshly refreshed token, or 403: the delegated grant no longer
+        lets this user read their calendar (revoked, consent withdrawn, policy change)."""
+        return self.status in (401, 403)
 
 
 class GraphNotFound(GraphError):
@@ -40,6 +49,10 @@ class GraphGone(GraphError):
 
 
 class GraphForbidden(GraphError):
+    pass
+
+
+class GraphUnauthorized(GraphError):
     pass
 
 
@@ -78,8 +91,8 @@ class GraphClient:
         self.redis = redis
         self.settings = settings
 
-    def source(self, tenant_id: str) -> "SourceGraph":
-        return SourceGraph(self, tenant_id)
+    def source(self, source_id: uuid.UUID, tenant_id: str) -> "SourceGraph":
+        return SourceGraph(self, source_id, tenant_id)
 
     def primary(self) -> "PrimaryGraph":
         return PrimaryGraph(self)
@@ -104,6 +117,7 @@ class GraphClient:
         app: App,
         tenant_id: str,
         scope: str,
+        source_id: uuid.UUID | None = None,
         json: Any = None,
         params: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
@@ -111,6 +125,8 @@ class GraphClient:
         method = method.upper()
         if app is App.SOURCE and method != "GET" and not _is_subscription_path(path):
             raise ReadOnlyViolation(f"Refusing {method} {path}: source calendars are read-only")
+        if app is App.SOURCE and source_id is None:
+            raise ValueError("Source calls need the linked source whose delegated token to use")
 
         wait = await self.throttled_for(scope)
         if wait:
@@ -124,11 +140,18 @@ class GraphClient:
             url = f"{url}?{urlencode(params, safe=':$')}"
 
         for attempt in range(2):
-            token = await self.tokens.get_token(app, tenant_id)
+            if source_id is not None:
+                token = await self.tokens.get_source_token(source_id)
+            else:
+                token = await self.tokens.get_token(app, tenant_id)
             req_headers = {"Authorization": f"Bearer {token}", **(headers or {})}
             resp = await self.http.request(method, url, json=json, headers=req_headers)
             if resp.status_code == 401 and attempt == 0:
-                await self.tokens.invalidate(app, tenant_id)
+                # Expired or revoked access token: drop it and refresh once.
+                if source_id is not None:
+                    await self.tokens.invalidate_source(source_id)
+                else:
+                    await self.tokens.invalidate(app, tenant_id)
                 continue
             break
 
@@ -146,8 +169,15 @@ class GraphClient:
                 code, message = err.get("code"), err.get("message", message)
             except ValueError:
                 pass
-            cls = {404: GraphNotFound, 410: GraphGone, 403: GraphForbidden}.get(resp.status_code, GraphError)
-            raise cls(resp.status_code, code, message)
+            cls = {
+                401: GraphUnauthorized,
+                403: GraphForbidden,
+                404: GraphNotFound,
+                410: GraphGone,
+            }.get(resp.status_code, GraphError)
+            error = cls(resp.status_code, code, message)
+            error.source_id = source_id
+            raise error
         if resp.status_code == 204 or not resp.content:
             return None
         return resp.json()
@@ -163,16 +193,24 @@ def calendar_base(user_id: str, calendar_id: str | None) -> str:
 
 
 class SourceGraph:
-    """Read-only access to a customer tenant, using the multi-tenant Calendars.Read app."""
+    """Read-only access to one linked source mailbox, with its owner's delegated
+    Calendars.Read token. Throttling is still tracked per customer tenant."""
 
-    def __init__(self, client: GraphClient, tenant_id: str):
+    def __init__(self, client: GraphClient, source_id: uuid.UUID, tenant_id: str):
         self.client = client
+        self.source_id = source_id
         self.tenant_id = tenant_id
         self.scope = f"tenant:{tenant_id}"
 
     async def _call(self, method: str, path: str, **kw: Any) -> dict[str, Any] | None:
         return await self.client.request(
-            method, path, app=App.SOURCE, tenant_id=self.tenant_id, scope=self.scope, **kw
+            method,
+            path,
+            app=App.SOURCE,
+            tenant_id=self.tenant_id,
+            scope=self.scope,
+            source_id=self.source_id,
+            **kw,
         )
 
     async def get_event(self, user_id: str, event_id: str) -> dict[str, Any]:
