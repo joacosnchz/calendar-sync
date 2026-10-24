@@ -4,19 +4,11 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 
-class PrimaryOut(BaseModel):
-    status: str
-    mailbox: str | None
-    error: str | None
-    mode: str
-
-
 class MeOut(BaseModel):
     id: uuid.UUID
     email: str
     display_name: str
     is_operator: bool
-    primary: PrimaryOut
 
 
 class TenantRef(BaseModel):
@@ -66,7 +58,6 @@ class CalendarEventOut(BaseModel):
     show_as: str
     labels: list[str]
     source_ids: list[uuid.UUID]
-    mirrored: bool
 
 
 class TenantUpdate(BaseModel):
@@ -95,16 +86,13 @@ class UserAdminOut(BaseModel):
     email: str
     display_name: str
     is_operator: bool
-    primary_status: str
-    primary_mailbox: str | None
-    primary_error: str | None
     source_count: int
-    mirror_count: int
+    # Stored source events across the user's sources.
+    event_count: int
     created_at: datetime
 
 
 class UserAdminUpdate(BaseModel):
-    primary_mailbox: str | None = Field(default=None, max_length=320)
     is_operator: bool | None = None
 
 
@@ -150,4 +138,5 @@ class OverviewOut(BaseModel):
     subscriptions_expiring_24h: int
     subscriptions_failing: int
     errors_24h: int
-    mirrors: int
+    # Stored source events across all users.
+    events: int

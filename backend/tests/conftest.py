@@ -22,15 +22,13 @@ async def harness() -> AsyncIterator[Harness]:
 @pytest_asyncio.fixture
 async def operator(harness: Harness):
     browser = await harness.sign_in("ops@calsync.example")
-    await harness.run_jobs()
     yield browser
     await browser.aclose()
 
 
 @pytest_asyncio.fixture
 async def alice(harness: Harness):
-    """Alice signed in, with a ready primary calendar."""
+    """Alice signed in (nothing linked yet)."""
     browser = await harness.sign_in("alice@contoso.example")
-    await harness.run_jobs()
     yield browser
     await browser.aclose()

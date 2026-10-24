@@ -1,4 +1,5 @@
-"""Microsoft Graph client with per-scope throttling and a hard read-only guard for sources."""
+"""Microsoft Graph client for source calendars: delegated tokens per linked source,
+per-tenant throttling and a hard read-only guard (FR-11)."""
 
 import logging
 import uuid
@@ -11,7 +12,7 @@ import httpx
 from redis.asyncio import Redis
 
 from app.config import Settings
-from app.graph.tokens import App, TokenService
+from app.graph.tokens import TokenService
 from app.timeutil import isoformat_z, utcnow
 
 log = logging.getLogger(__name__)
@@ -26,7 +27,7 @@ class GraphError(Exception):
         self.status = status
         self.code = code
         self.message = message
-        # Set when the call was made with a source's delegated token.
+        # The linked source whose delegated token made the call.
         self.source_id: uuid.UUID | None = None
 
     @property
@@ -94,9 +95,6 @@ class GraphClient:
     def source(self, source_id: uuid.UUID, tenant_id: str) -> "SourceGraph":
         return SourceGraph(self, source_id, tenant_id)
 
-    def primary(self) -> "PrimaryGraph":
-        return PrimaryGraph(self)
-
     # -- throttling -------------------------------------------------------------------
 
     async def throttled_for(self, scope: str) -> float:
@@ -114,19 +112,15 @@ class GraphClient:
         method: str,
         path: str,
         *,
-        app: App,
-        tenant_id: str,
+        source_id: uuid.UUID,
         scope: str,
-        source_id: uuid.UUID | None = None,
         json: Any = None,
         params: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
     ) -> dict[str, Any] | None:
         method = method.upper()
-        if app is App.SOURCE and method != "GET" and not _is_subscription_path(path):
+        if method != "GET" and not _is_subscription_path(path):
             raise ReadOnlyViolation(f"Refusing {method} {path}: source calendars are read-only")
-        if app is App.SOURCE and source_id is None:
-            raise ValueError("Source calls need the linked source whose delegated token to use")
 
         wait = await self.throttled_for(scope)
         if wait:
@@ -140,18 +134,12 @@ class GraphClient:
             url = f"{url}?{urlencode(params, safe=':$')}"
 
         for attempt in range(2):
-            if source_id is not None:
-                token = await self.tokens.get_source_token(source_id)
-            else:
-                token = await self.tokens.get_token(app, tenant_id)
+            token = await self.tokens.get_source_token(source_id)
             req_headers = {"Authorization": f"Bearer {token}", **(headers or {})}
             resp = await self.http.request(method, url, json=json, headers=req_headers)
             if resp.status_code == 401 and attempt == 0:
                 # Expired or revoked access token: drop it and refresh once.
-                if source_id is not None:
-                    await self.tokens.invalidate_source(source_id)
-                else:
-                    await self.tokens.invalidate(app, tenant_id)
+                await self.tokens.invalidate_source(source_id)
                 continue
             break
 
@@ -203,15 +191,7 @@ class SourceGraph:
         self.scope = f"tenant:{tenant_id}"
 
     async def _call(self, method: str, path: str, **kw: Any) -> dict[str, Any] | None:
-        return await self.client.request(
-            method,
-            path,
-            app=App.SOURCE,
-            tenant_id=self.tenant_id,
-            scope=self.scope,
-            source_id=self.source_id,
-            **kw,
-        )
+        return await self.client.request(method, path, source_id=self.source_id, scope=self.scope, **kw)
 
     async def get_event(self, user_id: str, event_id: str) -> dict[str, Any]:
         result = await self._call(
@@ -257,50 +237,3 @@ class SourceGraph:
 
     async def delete_subscription(self, subscription_id: str) -> None:
         await self._call("DELETE", f"subscriptions/{subscription_id}")
-
-
-class PrimaryGraph:
-    """Write access to primary calendars in our own tenant (Calendars.ReadWrite app)."""
-
-    def __init__(self, client: GraphClient):
-        self.client = client
-        self.tenant_id = client.settings.home_tenant_id
-
-    async def _call(self, method: str, path: str, *, mailbox: str, **kw: Any) -> dict[str, Any] | None:
-        # Writes are throttled per mailbox (Exchange limits apply per mailbox).
-        return await self.client.request(
-            method, path, app=App.PRIMARY, tenant_id=self.tenant_id, scope=f"mailbox:{mailbox.lower()}", **kw
-        )
-
-    async def get_default_calendar(self, mailbox: str) -> dict[str, Any]:
-        result = await self._call("GET", f"{_user(mailbox)}/calendar", mailbox=mailbox)
-        assert result is not None
-        return result
-
-    async def get_calendar(self, mailbox: str, calendar_id: str) -> dict[str, Any]:
-        result = await self._call("GET", calendar_base(mailbox, calendar_id), mailbox=mailbox)
-        assert result is not None
-        return result
-
-    async def create_calendar(self, mailbox: str, name: str) -> dict[str, Any]:
-        result = await self._call("POST", f"{_user(mailbox)}/calendars", mailbox=mailbox, json={"name": name})
-        assert result is not None
-        return result
-
-    async def delete_calendar(self, mailbox: str, calendar_id: str) -> None:
-        await self._call("DELETE", calendar_base(mailbox, calendar_id), mailbox=mailbox)
-
-    async def create_event(self, mailbox: str, calendar_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        result = await self._call(
-            "POST", f"{calendar_base(mailbox, calendar_id)}/events", mailbox=mailbox, json=payload
-        )
-        assert result is not None
-        return result
-
-    async def update_event(self, mailbox: str, event_id: str, payload: dict[str, Any]) -> None:
-        await self._call(
-            "PATCH", f"{_user(mailbox)}/events/{quote(event_id, safe='')}", mailbox=mailbox, json=payload
-        )
-
-    async def delete_event(self, mailbox: str, event_id: str) -> None:
-        await self._call("DELETE", f"{_user(mailbox)}/events/{quote(event_id, safe='')}", mailbox=mailbox)

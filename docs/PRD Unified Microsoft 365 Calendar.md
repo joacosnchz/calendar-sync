@@ -1,6 +1,6 @@
 # PRD: Unified Microsoft 365 Calendar
 
-Oct 22, 2026 · @Joaquin · Updated Oct 24, 2026: delegated permissions, no admin consent
+Oct 22, 2026 · @Joaquin · Updated Oct 24, 2026: delegated permissions, no admin consent; the unified calendar lives in the app (no primary calendar)
 
 ## Overview
 
@@ -8,7 +8,7 @@ We are building a service that connects to Microsoft 365 calendars across many t
 
 People who work across several organizations (consultants, agencies, holding companies, board members) keep a separate calendar in each tenant. They double-book, miss conflicts, and manually copy events between calendars. Microsoft 365 has no native way to see calendars from unrelated tenants in one place.
 
-The product is multi-user. Each user links the calendars they own, in any number of tenants, and the service mirrors those events into that user's own primary calendar in a Microsoft 365 tenant we operate. Users then see everything in one calendar in Outlook. Source calendars are never written to.
+The product is multi-user. Each user links the calendars they own, in any number of tenants, and the service integrates the events from all of those linked accounts into one unified calendar inside our app. There is no separate primary calendar or account in a tenant we operate, and the service writes to no Microsoft 365 calendar at all. Source calendars are never written to.
 
 Linking is self-service. To link a calendar, the user is sent to their own tenant's Microsoft sign-in page, approves read-only calendar access for themselves, and is redirected back. No tenant admin has to approve anything first. The service reads each calendar with that user's delegated permission. If that permission lapses, the service asks the user to sign in again instead of failing silently.
 
@@ -16,18 +16,19 @@ Linking is self-service. To link a calendar, the user is sent to their own tenan
 
 **Goals**
 
-- Let many users each unify their own set of source calendars into their own primary calendar.
+- Let many users each unify their own set of source calendars into their own calendar in the app.
 - Connect calendars from any number of Microsoft 365 tenants through one multi-tenant app registration.
 - Let users link a calendar on their own, by signing in to their tenant and consenting for themselves, with no tenant admin consent step.
-- Reflect event creates, updates and deletes in the primary calendar within seconds of the change.
+- Reflect event creates, updates and deletes in the unified calendar within seconds of the change.
 - Never silently lose sync: detect missed notifications and expired subscriptions, then recover automatically. When a user's sign-in expires or is revoked, ask that user to sign in again.
 - Leave tenant admins in control through their usual Entra ID tools (user consent policy, Enterprise application settings, Conditional Access), without asking them to do anything to get started.
 
 **Non-goals (v1)**
 
 - Non-Microsoft calendars (Google, iCloud, CalDAV).
-- Writing to source calendars. v1 is strictly read-only toward sources; it writes only to primary calendars in our tenant.
-- Editing events from the primary calendar back into their source.
+- Writing to any Microsoft 365 calendar. v1 is strictly read-only toward sources, and there is no primary calendar to write to.
+- Showing the unified calendar in Outlook or other calendar clients (for example by mirroring it into a mailbox or publishing an ICS feed).
+- Editing events from the unified calendar back into their source.
 - Scheduling features such as booking pages or meeting polls.
 
 **Success metrics**
@@ -44,17 +45,17 @@ Linking is self-service. To link a calendar, the user is sent to their own tenan
 
 | User | Need |
 | --- | --- |
-| End user (works across tenants) | Link the calendars they own by signing in to each one, see all of their meetings in one primary calendar, and reconnect when asked. |
+| End user (works across tenants) | Link the calendars they own by signing in to each one, see all of their meetings in one calendar in the app, and reconnect when asked. |
 | Tenant admin (customer IT) | Nothing is required to get started. Optionally, they can control whether users may consent, restrict which users can use the app, and revoke access at any time. |
-| Operator (our team) | Provision primary calendars, monitor subscription and sign-in health, and troubleshoot sync gaps. |
+| Operator (our team) | Monitor subscription and sign-in health, and troubleshoot sync gaps. |
 
 Core use cases:
 
-1. A user signs up, gets a primary calendar in our tenant, and links source accounts by signing in to each one in its own tenant. The first link from a tenant makes that tenant known to us. No admin step is needed.
-2. A user creates, moves or cancels a meeting in any linked source, and their primary calendar updates.
-3. A user opens their primary calendar and sees every meeting, with overlaps visible as in any Outlook calendar.
+1. A user signs up and links source accounts by signing in to each one in its own tenant. The first link from a tenant makes that tenant known to us. No admin step is needed.
+2. A user creates, moves or cancels a meeting in any linked source, and their unified calendar updates.
+3. A user opens the calendar in the app and sees every meeting from every linked account, labelled by account, with overlaps visible side by side.
 4. A user's access to a source lapses, for example from a password reset, an expired sign-in, or a new MFA policy. The platform pauses that source and asks the user to reconnect. After the user signs in again, sync catches up automatically.
-5. A user unlinks a source, and the mirrored events from that source are removed.
+5. A user unlinks a source, and that source's events disappear from the unified calendar.
 6. A user's organization doesn't allow users to consent to apps. The platform tells the user to ask their IT admin for approval.
 
 ## Functional requirements
@@ -62,20 +63,20 @@ Core use cases:
 | ID | Requirement | Priority |
 | --- | --- | --- |
 | FR-1 | Register a tenant automatically the first time one of its users links a calendar. No admin consent link or tenant invite is used. | Must |
-| FR-2 | Provision one primary calendar per user in our tenant. | Must |
+| FR-2 | Give each user one unified calendar in the app that integrates the calendars of all their linked accounts. Nothing is provisioned in any Microsoft 365 tenant. | Must |
 | FR-3 | Let each user link the source mailboxes they own through a delegated sign-in to their own tenant. The user consents to read-only calendar access, and the sign-in proves ownership. | Must |
 | FR-4 | Create a Graph subscription per linked source calendar for `created`, `updated` and `deleted` changes, using that user's delegated access. | Must |
 | FR-5 | Receive webhook notifications and fetch the full event from Graph (fetch-on-notify). | Must |
 | FR-6 | Renew every subscription before it expires. | Must |
 | FR-7 | Run a delta query per source calendar on linking, on missed notifications, and on a schedule. | Must |
-| FR-8 | Mirror every source event into the owning user's primary calendar, labelled by source. | Must |
-| FR-9 | Create mirrored events without attendees, so no invitations or responses are ever sent. | Must |
-| FR-10 | Keep each mirrored event's show-as status (busy, tentative, free) so free/busy is accurate. | Must |
+| FR-8 | Show every source event in the owning user's unified calendar, labelled by source. | Must |
+| FR-9 | Store only the fields the calendar shows. Never read attendees or event bodies into storage. | Must |
+| FR-10 | Keep each event's show-as status (busy, tentative, free) so free/busy is accurate. | Must |
 | FR-11 | Never write to a source calendar. | Must |
-| FR-12 | Remove mirrored events when a user unlinks a source. | Must |
+| FR-12 | Remove a source's events from the unified calendar, and its stored data, when a user unlinks it. | Must |
 | FR-13 | Show per-user and per-tenant sync health (last notification, subscription expiry, sign-in status, errors). | Should |
-| FR-14 | When one meeting appears in two of a user's sources, mirror it once. | Should |
-| FR-15 | When a source's refresh token is expired, revoked, or needs fresh sign-in (MFA, Conditional Access), mark the source "reauthentication required", pause its sync, keep its existing mirrors, and ask the user to reconnect. | Must |
+| FR-14 | When one meeting appears in two of a user's sources, show it once. | Should |
+| FR-15 | When a source's refresh token is expired, revoked, or needs fresh sign-in (MFA, Conditional Access), mark the source "reauthentication required", pause its sync, keep its already-synced events in the calendar, and ask the user to reconnect. | Must |
 | FR-16 | Let the user reconnect a paused source by signing in to the same account. On success, resume sync, recreate the subscription if needed, and catch up with a delta resync. | Must |
 | FR-17 | If the user's tenant blocks user consent, tell the user that IT admin approval is needed, instead of showing a generic error. | Should |
 
@@ -98,11 +99,9 @@ One multi-tenant app registration in our home tenant serves every customer tenan
 - Credentials: a certificate (preferred) or client secret, because the app is a confidential client. They are stored only in our home tenant and our secret store.
 - Publisher verification: complete it by linking a Microsoft Partner ID. This matters more with user consent than it did with admin consent. Many tenants, including those on Microsoft's recommended default policy, let users consent only to apps from verified publishers.
 
-**Writing to primary calendars (our tenant)**
+**No write access anywhere**
 
-- Mirrors are written by a second, single-tenant app registration in our own tenant, using `Calendars.ReadWrite` as an *application* permission. It stays app-only for two reasons: users have no account in our tenant to delegate from (for example, when primary calendars live in a shared mailbox), and the writes happen in the background when a source changes.
-- Only our own administrators grant consent for it, once. Customer tenants never see this app.
-- Scope it with an application access policy (or RBAC for Applications) to the mailboxes that hold primary calendars.
+- The unified calendar is stored and shown by the app itself, so there is no second app registration, no `Calendars.ReadWrite` permission and no mailbox in our own tenant. The source app above is the only app registration.
 
 **Platform sign-in**
 
@@ -132,7 +131,7 @@ One multi-tenant app registration in our home tenant serves every customer tenan
 **Reauthentication** (FR-15, FR-16)
 
 1. When a refresh fails with an error that needs user interaction, the source moves to `reauth_required`. Examples are `invalid_grant`, `interaction_required` and `consent_required` (AADSTS70008, 700082, 50173, 50076, 50079, 65001 and similar). Network errors and Microsoft 5xx responses are retried instead.
-2. Sync for that source pauses: renewals, delta queries and notification processing skip it. Its existing mirrors stay in the primary calendar, so the user's view is stale but not empty.
+2. Sync for that source pauses: renewals, delta queries and notification processing skip it. Its already-synced events stay in the unified calendar, so the user's view is stale but not empty.
 3. The dashboard shows a banner and a Reconnect button on the source. Reconnect sends the user to that tenant's sign-in page with their account pre-filled (`login_hint`).
 4. The returning `tid`/`oid` must match the paused source. A different account is rejected with a clear message.
 5. On success, the platform stores the new refresh token, reactivates the source, recreates or renews its subscription, and runs a delta resync to pick up everything that changed while it was paused.
@@ -214,33 +213,32 @@ Every event is keyed by tenant, mailbox and Graph event ID, so the same ID in tw
 
 | Entity | Key fields |
 | --- | --- |
-| User | user\_id, email, primary\_calendar (mailbox + calendar ID in our tenant), created\_at |
+| User | user\_id, email, created\_at |
 | Tenant | tenant\_id, display name, domain, copy\_details, created\_at (first link from the tenant) |
 | Linked source | user\_id, tenant\_id, source\_user\_id, calendar\_id, refresh\_token (encrypted), delta\_link, last\_synced\_at, status (`active`, `reauth_required`, `removing`, `error`), reauth\_required\_at |
 | Subscription | subscription\_id, linked source, client\_state (encrypted), expires\_at, status |
 | Source event | linked source + Graph event ID, subject, start, end, time zone, location, show\_as, is\_all\_day, iCalUId, last\_modified |
-| Mirror mapping | source event key → mirrored event ID in the user's primary calendar, last\_written\_at |
 
 **Sync rules**
 
-- **Create or update:** fetch the source event, store it if Graph's `lastModifiedDateTime` is newer, then create or update the mirrored event via the mirror mapping.
-- **Delete:** on a `deleted` notification or delta `@removed` entry, delete the mirrored event and the mapping.
-- **No attendees on mirrors:** mirrored events carry subject, time, location, show-as and a source label, but no attendee list, so Exchange never sends invitations.
-- **Recurring events:** mirror individual occurrences from `calendarView` over a rolling window (proposed: 90 days back, 365 ahead), so exceptions and cancellations stay correct.
-- **Duplicates within one user:** if the same meeting appears in two of a user's sources, group by `iCalUId` and mirror it once.
-- **Isolation between users:** two users can link the same source mailbox only if both proved ownership; each gets their own mirror.
-- **Time zones:** store times in UTC plus the original time zone, and write mirrors with the original time zone.
+- **Create or update:** fetch the source event and store it if Graph's `lastModifiedDateTime` is newer. The unified calendar is built from stored events when it is opened, so the change shows up on the next refresh.
+- **Delete:** on a `deleted` notification or delta `@removed` entry, delete the stored event.
+- **No attendees:** stored events carry subject, time, location, show-as and sensitivity, but no attendee list or body.
+- **Recurring events:** store individual occurrences from `calendarView` over a rolling window (proposed: 90 days back, 365 ahead), so exceptions and cancellations stay correct.
+- **Duplicates within one user:** if the same meeting appears in two of a user's sources, group by `iCalUId` and show it once, labelled with every source it came from. The busiest show-as wins.
+- **Isolation between users:** two users can link the same source mailbox only if both proved ownership; each gets their own copy of its events.
+- **Time zones:** store times in UTC plus the original time zone, and show them in the viewer's time zone.
 
 ## Security, privacy and compliance
 
-- **Least privilege:** customer tenants grant only delegated `Calendars.Read` (plus sign-in scopes), one user at a time. The app has no tenant-wide or application permissions in customer tenants and can read only the mailboxes of users who signed in and consented. Write access (`Calendars.ReadWrite`) exists only in our own tenant, in a separate app scoped to primary-calendar mailboxes.
+- **Least privilege:** customer tenants grant only delegated `Calendars.Read` (plus sign-in scopes), one user at a time. The app has no tenant-wide or application permissions in customer tenants and can read only the mailboxes of users who signed in and consented. The platform has no write access to any calendar.
 - **Proof of ownership:** a user can link a source mailbox only by signing in to it. The delegated token itself can't reach any other mailbox.
 - **Secrets:** keep certificates or client secrets in a managed vault (e.g. Azure Key Vault) and rotate them on a schedule.
 - **Refresh tokens:** encrypt them at rest with rotating keys, never log them or send them to the browser, and delete a source's token when the source is unlinked or its user is deleted.
 - **Webhook trust:** validate `clientState` on every notification before processing.
-- **Isolation:** every query is scoped by user and tenant. One user's events must never be mirrored into another user's primary calendar.
-- **Data at rest:** encrypt event data, and store only the fields the mirror needs (no event body or attendee list).
-- **Retention and deletion:** delete a user's mirrors and stored data within an agreed window after unlinking or account deletion. A source paused for reauthentication keeps its mirrors until the user reconnects or unlinks. How long to keep them is an open question below.
+- **Isolation:** every query is scoped by user and tenant. One user's events must never appear in another user's calendar.
+- **Data at rest:** encrypt event data, and store only the fields the calendar shows (no event body or attendee list).
+- **Retention and deletion:** delete a user's stored data within an agreed window after unlinking or account deletion. A source paused for reauthentication keeps its events until the user reconnects or unlinks. How long to keep them is an open question below.
 - **Compliance:** event data is personal data under GDPR. We need a DPA with customers, a documented data location, and audit logs of access.
 
 ## Non-functional requirements
@@ -264,25 +262,22 @@ Each gate must pass before the next phase starts. Dates are an open question unt
 | Risk | Mitigation |
 | --- | --- |
 | Tenants that disable or restrict user consent block self-service linking | Publisher verification (required under Microsoft's recommended user consent setting), read-only delegated permission only, and a clear "ask your IT admin" message that points to the admin consent workflow (FR-17) |
-| Refresh tokens expire or are revoked (password reset, MFA or Conditional Access changes, 90-day inactivity), pausing sync | Detect on refresh, pause the source without losing mirrors, prompt with a dashboard banner and a one-click Reconnect, then delta resync on return (FR-15, FR-16). Regular syncing keeps tokens from going inactive |
-| Users ignore the reconnect prompt, so the primary calendar goes stale | Mark paused sources clearly. Email reminders and a retention limit are open questions below |
+| Refresh tokens expire or are revoked (password reset, MFA or Conditional Access changes, 90-day inactivity), pausing sync | Detect on refresh, pause the source without losing its events, prompt with a dashboard banner and a one-click Reconnect, then delta resync on return (FR-15, FR-16). Regular syncing keeps tokens from going inactive |
+| Users ignore the reconnect prompt, so part of the unified calendar goes stale | Mark paused sources clearly. Email reminders and a retention limit are open questions below |
 | Stored refresh tokens are a high-value secret | Encryption at rest with key rotation, never sent to the browser, deleted on unlink |
 | Silent sync gaps from expired subscriptions or dropped notifications | Proactive renewal, lifecycle notifications, scheduled delta resync |
 | Graph throttling on reads in large tenants | Per-tenant backoff, delta instead of full fetches |
-| Graph throttling on writes into our tenant (limits apply per mailbox) | Queue writes per primary mailbox, batch requests, back off on `429` |
-| Mirrors accidentally send invitations | Never set attendees on mirrored events (FR-9), covered by automated tests |
-| Cost of a mailbox per user in our tenant | Decide the primary-calendar hosting model early (open question below) |
+| Users expect to see the unified calendar in Outlook or on their phone | v1 shows it only in the app. An ICS feed or similar is an open question below |
 | Notification storms (e.g. bulk updates) | Queue buffering and de-duplication by event ID |
 
 Open questions:
 
 - [x] Is v1 read-only? Yes: strictly read-only toward source calendars.
-- [x] Where is the unified calendar shown? In one primary calendar per user, hosted in a tenant we operate.
+- [x] Where is the unified calendar shown? In the app itself. The earlier design (one primary calendar per user in a tenant we operate, written by a separate app-only `Calendars.ReadWrite` app) was dropped, so there is nothing to host, license or share.
 - [x] Rich notifications or fetch-on-notify? Fetch-on-notify is good enough.
-- [ ] How is each primary calendar hosted: a licensed mailbox per user, or a calendar inside a shared mailbox?
-- [ ] How do users open their primary calendar: an account in our tenant, or the calendar shared to their own work account?
-- [ ] Which event fields may we mirror, and do any customers forbid copying meeting subjects?
+- [ ] Should users also be able to subscribe to their unified calendar from Outlook or a phone (for example a private ICS feed)?
+- [ ] Which event fields may we store and show, and do any customers forbid copying meeting subjects?
 - [ ] What are the latency and onboarding-time targets in the success metrics?
 - [x] Application or delegated permissions for source calendars? Delegated. Each user signs in to their own tenant and consents for themselves, so no tenant admin consent is required and unattended app-only access isn't needed.
 - [ ] Should we also email users when a source needs reconnecting, or is the in-app banner enough for v1?
-- [ ] How long should a source stay paused before we remove its mirrors (proposed: 30 days)?
+- [ ] How long should a source stay paused before we remove its events (proposed: 30 days)?

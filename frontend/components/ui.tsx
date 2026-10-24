@@ -29,10 +29,7 @@ export function Badge({ tone = "neutral", children }: { tone?: Tone; children: R
 
 const STATUS_TONES: Record<string, Tone> = {
   active: "good",
-  ready: "good",
   reauth_required: "warn",
-  provisioning: "info",
-  unassigned: "warn",
   removing: "neutral",
   error: "bad",
   renew_failed: "bad",

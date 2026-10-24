@@ -52,8 +52,6 @@ class SchedulerSettings:
     cron_jobs = [
         cron(sweeps.renew_sweep, minute=set(range(0, 60, 15)), run_at_startup=True),
         cron(sweeps.delta_sweep, minute=set(range(5, 60, 15)), run_at_startup=True),
-        cron(sweeps.mirror_audit_sweep, minute={10, 40}),
-        cron(sweeps.provisioning_sweep, minute={20, 50}),
     ]
     on_startup = _startup
     on_shutdown = _shutdown

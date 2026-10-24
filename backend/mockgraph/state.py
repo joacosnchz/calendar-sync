@@ -87,9 +87,6 @@ class MockTenant:
     tenant_id: str
     name: str
     domain: str
-    is_home: bool = False
-    # Apps with application permissions here (only our primary app, in the home tenant).
-    consented_apps: set[str] = field(default_factory=set)
     users: dict[str, MockUser] = field(default_factory=dict)
     throttle_remaining: int = 0
     drop_notifications: bool = False
@@ -156,22 +153,14 @@ class MockState:
     def __init__(
         self,
         *,
-        home_tenant_id: str,
         source_app_id: str,
         source_app_secret: str,
-        primary_app_id: str,
-        primary_app_secret: str,
-        shared_mailbox: str,
         token_secret: str = "mockgraph-signing-key-not-secret-0123456789",
         inline_delivery: bool = False,
         notify_transport: httpx.AsyncBaseTransport | None = None,
     ):
-        self.home_tenant_id = home_tenant_id
         self.source_app_id = source_app_id
         self.source_app_secret = source_app_secret
-        self.primary_app_id = primary_app_id
-        self.primary_app_secret = primary_app_secret
-        self.shared_mailbox = shared_mailbox.lower()
         self.token_secret = token_secret
         self.inline_delivery = inline_delivery
         self.notifier = httpx.AsyncClient(transport=notify_transport, timeout=10.0)
@@ -191,12 +180,8 @@ class MockState:
 
     # -- directory --------------------------------------------------------------------
 
-    def add_tenant(
-        self, name: str, domain: str, *, tenant_id: str | None = None, is_home: bool = False
-    ) -> MockTenant:
-        tenant = MockTenant(tenant_id=tenant_id or _tid(domain), name=name, domain=domain, is_home=is_home)
-        if is_home:
-            tenant.consented_apps.add(self.primary_app_id)
+    def add_tenant(self, name: str, domain: str, *, tenant_id: str | None = None) -> MockTenant:
+        tenant = MockTenant(tenant_id=tenant_id or _tid(domain), name=name, domain=domain)
         self.tenants[tenant.tenant_id] = tenant
         return tenant
 
@@ -230,39 +215,27 @@ class MockState:
     # -- tokens -----------------------------------------------------------------------
 
     def _check_client(self, client_id: str, client_secret: str | None) -> None:
-        expected = {self.source_app_id: self.source_app_secret, self.primary_app_id: self.primary_app_secret}
-        if client_id not in expected:
+        if client_id != self.source_app_id:
             raise MockGraphError(
                 400,
                 "unauthorized_client",
                 f"AADSTS700016: Application with identifier '{client_id}' was not found.",
             )
-        if client_secret != expected[client_id]:
+        if client_secret != self.source_app_secret:
             raise MockGraphError(401, "invalid_client", "AADSTS7000215: Invalid client secret provided.")
 
     def issue_app_token(self, tenant_ref: str, client_id: str, client_secret: str | None) -> dict[str, Any]:
+        """Client credentials: always refused. The only app is delegated-only."""
         tenant = self.find_tenant(tenant_ref)
         if tenant is None:
             raise MockGraphError(400, "invalid_tenant", f"AADSTS90002: Tenant '{tenant_ref}' not found.")
         self._check_client(client_id, client_secret)
-        if client_id == self.source_app_id:
-            raise MockGraphError(
-                400,
-                "unauthorized_client",
-                f"AADSTS700016: Application '{client_id}' has no application permissions in tenant "
-                f"'{tenant.tenant_id}'. The source app is delegated-only: use a user's refresh token.",
-            )
-        if not tenant.is_home:
-            raise MockGraphError(
-                400,
-                "unauthorized_client",
-                "AADSTS700016: Application not found in the directory (single-tenant app).",
-            )
-        return {
-            "token_type": "Bearer",
-            "expires_in": 3599,
-            "access_token": self.sign({"kind": "app", "tid": tenant.tenant_id, "appid": client_id}),
-        }
+        raise MockGraphError(
+            400,
+            "unauthorized_client",
+            f"AADSTS700016: Application '{client_id}' has no application permissions in tenant "
+            f"'{tenant.tenant_id}'. The source app is delegated-only: use a user's refresh token.",
+        )
 
     def consent_needed(self, user: MockUser, client_id: str, scopes: list[str]) -> set[str]:
         granted = self.grants.get((user.oid, client_id), set())
@@ -363,9 +336,6 @@ class MockState:
             claims = jwt.decode(token, self.token_secret, algorithms=["HS256"])
         except jwt.PyJWTError as exc:
             raise MockGraphError(401, "InvalidAuthenticationToken", str(exc)) from exc
-        tenant = self.tenants.get(claims["tid"])
-        if claims.get("kind") == "app" and (tenant is None or claims["appid"] not in tenant.consented_apps):
-            raise MockGraphError(401, "InvalidAuthenticationToken", "Application access has been revoked.")
         if claims.get("kind") == "delegated":
             user = self.users.get(claims.get("oid", ""))
             if user is None or claims.get("gen") != user.session_generation:
@@ -419,8 +389,6 @@ class MockState:
             "categories": payload.get("categories", []),
             "body": payload.get("body") or {"contentType": "text", "content": ""},
             "attendees": payload.get("attendees", []),
-            "transactionId": payload.get("transactionId"),
-            "singleValueExtendedProperties": payload.get("singleValueExtendedProperties", []),
             "createdDateTime": now,
             "lastModifiedDateTime": now,
         }
@@ -437,7 +405,6 @@ class MockState:
             "isReminderOn",
             "attendees",
             "isCancelled",
-            "singleValueExtendedProperties",
         ):
             if key in patch:
                 event[key] = patch[key]
@@ -459,11 +426,6 @@ class MockState:
         ical_uid: str | None = None,
     ) -> dict[str, Any]:
         cal = self.calendar_for(user, calendar_id)
-        txn = payload.get("transactionId")
-        if txn:
-            for existing in cal.events.values():
-                if existing.get("transactionId") == txn:
-                    return existing  # Graph de-duplicates retried creates
         event = self.build_event(payload, ical_uid=ical_uid)
         cal.events[event["id"]] = event
         self._bump(cal, event["id"])
@@ -536,7 +498,7 @@ class MockState:
         for eid in chunk:
             ev = cal.events.get(eid)
             if ev is not None and self._in_window(ev, start, end):
-                value.append(public_event(ev))
+                value.append(ev)
             elif not tok.get("full"):
                 value.append({"id": eid, "@removed": {"reason": "deleted"}})
         link_base = f"{base_url}/v1.0/users/{user.oid}/calendarView/delta"
@@ -788,17 +750,11 @@ class MockState:
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
 
 
-def public_event(event: dict[str, Any]) -> dict[str, Any]:
-    return {k: v for k, v in event.items() if k not in ("singleValueExtendedProperties",)}
-
-
 def seed(state: MockState) -> None:
-    """Demo directory: our host tenant plus three customer tenants."""
-    home = state.add_tenant(
-        "Calendar Sync (host)", "calsync.example", tenant_id=state.home_tenant_id, is_home=True
-    )
-    state.add_user(home, state.shared_mailbox, "Unified Calendars")
-    state.add_user(home, "ops@calsync.example", "Olivia Operator")
+    """Demo directory: three customer tenants, plus ours, which only holds the operator's
+    sign-in (it is an ordinary tenant to the app)."""
+    ours = state.add_tenant("Calendar Sync", "calsync.example")
+    state.add_user(ours, "ops@calsync.example", "Olivia Operator")
 
     contoso = state.add_tenant("Contoso", "contoso.example")
     fabrikam = state.add_tenant("Fabrikam", "fabrikam.example")
@@ -857,7 +813,7 @@ async def seed_events(state: MockState) -> None:
             "showAs": "oof",
         },
     )
-    # One meeting that appears in two of Alice's calendars (same iCalUId): mirrored once.
+    # One meeting that appears in two of Alice's calendars (same iCalUId): shown once.
     shared = await state.create_event(
         alice_c, {"subject": "Contoso x Fabrikam partnership", "start": at(2, 15), "end": at(2, 16)}
     )

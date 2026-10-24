@@ -1,4 +1,4 @@
-"""Operator API: customer tenants (FR-1), primary calendars (FR-2), sync health (FR-13).
+"""Operator API: customer tenants (FR-1), users, sync health (FR-13).
 
 Customer tenants are recorded automatically the first time a user links a mailbox from
 one; there is no onboarding or admin consent step. Operators can rename them and set the
@@ -18,8 +18,6 @@ from app.audit import audit
 from app.models import (
     AuditLog,
     LinkedSource,
-    MirrorMapping,
-    PrimaryStatus,
     SourceEvent,
     SourceStatus,
     Subscription,
@@ -30,7 +28,7 @@ from app.models import (
 )
 from app.queue import sync_key
 from app.services import Services
-from app.sync.source_sync import SyncMode, enqueue_reconciles
+from app.sync.source_sync import SyncMode
 from app.timeutil import utcnow
 
 router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[Depends(csrf_protect)])
@@ -67,10 +65,7 @@ async def overview(
             .where(SyncError.created_at > now - timedelta(hours=24))
         )
         or 0,
-        mirrors=await session.scalar(
-            select(func.count()).select_from(MirrorMapping).where(MirrorMapping.graph_event_id.is_not(None))
-        )
-        or 0,
+        events=await session.scalar(select(func.count()).select_from(SourceEvent)) or 0,
     )
 
 
@@ -145,13 +140,11 @@ async def update_tenant(
     tenant_pk: uuid.UUID,
     body: schemas.TenantUpdate,
     operator: User = Depends(require_operator),
-    services: Services = Depends(get_services),
     session: AsyncSession = Depends(get_session),
 ) -> schemas.TenantOut:
     tenant = await session.get(Tenant, tenant_pk)
     if tenant is None:
         raise HTTPException(404, "Tenant not found")
-    details_changed = body.copy_details is not None and body.copy_details != tenant.copy_details
     if body.display_name is not None:
         tenant.display_name = body.display_name
     if body.copy_details is not None:
@@ -159,21 +152,8 @@ async def update_tenant(
     audit(
         session, "tenant.updated", "tenant", tenant.id, actor=operator, **body.model_dump(exclude_none=True)
     )
+    # The privacy control is applied when the calendar is read: it takes effect at once.
     await session.commit()
-    if details_changed:
-        rows = (
-            await session.execute(
-                select(LinkedSource.user_id, SourceEvent.dedup_key)
-                .join(SourceEvent, SourceEvent.source_id == LinkedSource.id)
-                .where(LinkedSource.tenant_pk == tenant.id)
-                .distinct()
-            )
-        ).all()
-        by_user: dict[uuid.UUID, set[str]] = {}
-        for user_id, key in rows:
-            by_user.setdefault(user_id, set()).add(key)
-        for user_id, keys in by_user.items():
-            await enqueue_reconciles(services, user_id, keys)
     return (await _tenant_out(session, [tenant]))[0]
 
 
@@ -190,12 +170,12 @@ async def list_users(
             await session.execute(select(LinkedSource.user_id, func.count()).group_by(LinkedSource.user_id))
         ).all()
     )
-    mirrors = dict(
+    events = dict(
         (
             await session.execute(
-                select(MirrorMapping.user_id, func.count())
-                .where(MirrorMapping.graph_event_id.is_not(None))
-                .group_by(MirrorMapping.user_id)
+                select(LinkedSource.user_id, func.count(SourceEvent.id))
+                .join(SourceEvent, SourceEvent.source_id == LinkedSource.id)
+                .group_by(LinkedSource.user_id)
             )
         ).all()
     )
@@ -205,11 +185,8 @@ async def list_users(
             email=u.email,
             display_name=u.display_name,
             is_operator=u.is_operator,
-            primary_status=u.primary_status,
-            primary_mailbox=u.primary_mailbox,
-            primary_error=u.primary_error,
             source_count=sources.get(u.id, 0),
-            mirror_count=mirrors.get(u.id, 0),
+            event_count=events.get(u.id, 0),
             created_at=u.created_at,
         )
         for u in users
@@ -221,64 +198,18 @@ async def update_user(
     user_id: uuid.UUID,
     body: schemas.UserAdminUpdate,
     operator: User = Depends(require_operator),
-    services: Services = Depends(get_services),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     user = await session.get(User, user_id)
     if user is None:
         raise HTTPException(404, "User not found")
-    provision = False
     if body.is_operator is not None:
         if user.id == operator.id and not body.is_operator:
             raise HTTPException(400, "You can't remove your own operator access")
         user.is_operator = body.is_operator
-    if body.primary_mailbox is not None:
-        if services.settings.primary_calendar_mode != "user_mailbox":
-            raise HTTPException(400, "Primary mailboxes are assigned automatically in shared_mailbox mode")
-        mailbox = body.primary_mailbox.strip().lower()
-        if mailbox != (user.primary_mailbox or ""):
-            user.primary_mailbox = mailbox
-            user.primary_calendar_id = None
-            user.primary_status = PrimaryStatus.PROVISIONING
-            provision = True
     audit(session, "user.updated", "user", user.id, actor=operator, **body.model_dump(exclude_none=True))
     await session.commit()
-    if provision:
-        await services.queue.enqueue("provision_primary", str(user.id))
-    return {"status": "provisioning" if provision else "updated"}
-
-
-@router.post("/users/{user_id}/provision", status_code=202)
-async def provision_user(
-    user_id: uuid.UUID,
-    operator: User = Depends(require_operator),
-    services: Services = Depends(get_services),
-    session: AsyncSession = Depends(get_session),
-) -> dict:
-    user = await session.get(User, user_id)
-    if user is None:
-        raise HTTPException(404, "User not found")
-    user.primary_status = PrimaryStatus.PROVISIONING
-    user.primary_error = None
-    audit(session, "primary.provision_requested", "user", user.id, actor=operator)
-    await session.commit()
-    await services.queue.enqueue("provision_primary", str(user.id))
-    return {"status": "provisioning"}
-
-
-@router.post("/users/{user_id}/rebuild", status_code=202)
-async def rebuild_user(
-    user_id: uuid.UUID,
-    operator: User = Depends(require_operator),
-    services: Services = Depends(get_services),
-    session: AsyncSession = Depends(get_session),
-) -> dict:
-    if await session.get(User, user_id) is None:
-        raise HTTPException(404, "User not found")
-    audit(session, "mirrors.rebuild_requested", "user", user_id, actor=operator)
-    await session.commit()
-    await services.queue.enqueue("rebuild_user", str(user_id))
-    return {"status": "queued"}
+    return {"status": "updated"}
 
 
 @router.post("/sources/{source_id}/resync", status_code=202)

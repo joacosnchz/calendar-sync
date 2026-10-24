@@ -1,7 +1,7 @@
 [project]
 name = "calendar-sync"
 version = "0.1.0"
-description = "Unified Microsoft 365 calendar: mirrors source calendars across tenants into one primary calendar per user."
+description = "Unified Microsoft 365 calendar: reads source calendars across tenants into one unified calendar per user."
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.161",

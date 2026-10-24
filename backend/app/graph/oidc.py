@@ -14,7 +14,7 @@ import httpx
 import jwt
 
 from app.config import Settings
-from app.graph.tokens import App, credentials_for
+from app.graph.tokens import source_app_credentials
 
 SIGN_IN_SCOPES = "openid profile email User.Read"
 LINK_SCOPES = "openid profile email offline_access User.Read Calendars.Read"
@@ -97,7 +97,7 @@ async def exchange_code(
     tenant: str = "organizations",
 ) -> CodeExchange:
     token_url = f"{settings.login_base_url.rstrip('/')}/{tenant}/oauth2/v2.0/token"
-    creds = credentials_for(settings, App.SOURCE)
+    creds = source_app_credentials(settings)
     try:
         resp = await http.post(
             token_url,

@@ -25,5 +25,4 @@ DELTA_DRIFT = Counter(
     "Changes found by a scheduled/recovery delta that notifications had not delivered",
     ["tenant"],
 )
-MIRROR_WRITES = Counter("calsync_mirror_writes_total", "Writes to primary calendars", ["op"])
 JOB_FAILURES = Counter("calsync_job_failures_total", "Worker jobs that failed", ["job"])

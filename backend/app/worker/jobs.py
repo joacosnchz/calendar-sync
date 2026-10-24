@@ -15,16 +15,9 @@ from app.graph.client import GraphError, GraphForbidden, GraphThrottled
 from app.graph.tokens import TokenError
 from app.metrics import FETCH_ERRORS, JOB_FAILURES, THROTTLED
 from app.models import LinkedSource, SyncError
-from app.queue import (
-    PENDING_TTL_SECONDS,
-    lifecycle_key,
-    notification_key,
-    reconcile_key,
-    renew_key,
-    sync_key,
-)
+from app.queue import PENDING_TTL_SECONDS, lifecycle_key, notification_key, renew_key, sync_key
 from app.services import Services
-from app.sync import lifecycle, mirror, source_sync, subscriptions
+from app.sync import lifecycle, source_sync, subscriptions
 from app.sync.source_sync import SyncMode
 from app.timeutil import utcnow
 
@@ -96,7 +89,7 @@ async def run_job(
     except TokenError as exc:
         reauth_source = exc.source_id or source_id
         if exc.reauth_required and reauth_source:
-            # Only the user can fix this (sign in again): pause the source, keep mirrors.
+            # Only the user can fix this (sign in again): pause the source, keep its events.
             await lifecycle.mark_reauth_required(services, reauth_source, _reauth_reason(exc))
             return "reauth-required"
         if exc.transient:
@@ -162,31 +155,6 @@ async def sync_source(ctx: dict, source_id: str, mode: str) -> Any:
     return await run_job(ctx, "sync_source", run, key=sync_key(sid, mode), source_id=sid)
 
 
-async def reconcile_group(ctx: dict, user_id: str, dedup_key: str, force: bool = False) -> Any:
-    uid = uuid.UUID(user_id)
-    return await run_job(
-        ctx,
-        "reconcile_group",
-        lambda s: mirror.reconcile_group(s, uid, dedup_key, force=force),
-        key=None if force else reconcile_key(uid, dedup_key),
-        user_id=uid,
-    )
-
-
-async def rebuild_user(ctx: dict, user_id: str) -> Any:
-    """Operator recovery: re-check every mirror, recreating any deleted from Outlook."""
-    uid = uuid.UUID(user_id)
-
-    async def run(s: Services) -> str:
-        async with s.sessionmaker() as session:
-            keys = await mirror.all_dedup_keys(session, uid)
-        for key in keys:
-            await s.queue.enqueue("reconcile_group", user_id, key, True)
-        return f"queued={len(keys)}"
-
-    return await run_job(ctx, "rebuild_user", run, user_id=uid)
-
-
 # --- subscription jobs ---------------------------------------------------------------
 
 
@@ -239,11 +207,6 @@ async def remove_source(ctx: dict, source_id: str, reason: str = "unlinked") -> 
     return await run_job(ctx, "remove_source", lambda s: lifecycle.purge_source(s, sid, reason=reason))
 
 
-async def provision_primary(ctx: dict, user_id: str) -> Any:
-    uid = uuid.UUID(user_id)
-    return await run_job(ctx, "provision_primary", lambda s: lifecycle.provision_primary(s, uid), user_id=uid)
-
-
 async def delete_user(ctx: dict, user_id: str) -> Any:
     uid = uuid.UUID(user_id)
     return await run_job(ctx, "delete_user", lambda s: lifecycle.delete_user(s, uid))
@@ -252,13 +215,10 @@ async def delete_user(ctx: dict, user_id: str) -> Any:
 JOB_FUNCTIONS = [
     process_notification,
     sync_source,
-    reconcile_group,
-    rebuild_user,
     setup_source,
     ensure_subscription,
     renew_subscription,
     handle_lifecycle,
     remove_source,
-    provision_primary,
     delete_user,
 ]

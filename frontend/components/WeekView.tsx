@@ -32,7 +32,7 @@ export function addDays(date: Date, days: number): Date {
   return d;
 }
 
-/** Lay out overlapping events side by side, like Outlook does. */
+/** Lay out overlapping events side by side, like desktop calendar apps do. */
 export function layoutDay(events: CalendarEvent[], dayStart: Date): Placed[] {
   const dayEnd = addDays(dayStart, 1);
   const segments = events
@@ -208,7 +208,7 @@ function EventChip({
   const free = event.show_as === "free";
   return (
     <div
-      title={`${event.subject}\n${event.labels.join(" · ")}${event.location ? `\n${event.location}` : ""}\nShow as: ${event.show_as}${event.mirrored ? "" : "\n(not yet in Outlook)"}`}
+      title={`${event.subject}\n${event.labels.join(" · ")}${event.location ? `\n${event.location}` : ""}\nShow as: ${event.show_as}`}
       className={cx(
         "h-full overflow-hidden rounded-md border-l-4 px-1.5 py-0.5 text-xs leading-tight",
         color.bg,
@@ -216,7 +216,6 @@ function EventChip({
         color.text,
         tentative && "bg-[repeating-linear-gradient(45deg,transparent,transparent_4px,rgba(255,255,255,.7)_4px,rgba(255,255,255,.7)_8px)]",
         free && "opacity-60",
-        !event.mirrored && "border-dashed",
       )}
     >
       <div className="truncate font-medium">{event.subject || "(no subject)"}</div>

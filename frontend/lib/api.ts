@@ -1,21 +1,18 @@
 // Typed client for the FastAPI backend (proxied same-origin under /api and /auth).
 
-export type PrimaryStatus = "unassigned" | "provisioning" | "ready" | "error";
-
 export interface Me {
   id: string;
   email: string;
   display_name: string;
   is_operator: boolean;
-  primary: { status: PrimaryStatus; mailbox: string | null; error: string | null; mode: string };
 }
 
 export interface Source {
   id: string;
   label: string;
   source_email: string;
-  // reauth_required: the refresh token expired or was revoked. Mirrored events are kept,
-  // but syncing is paused until the user signs in again via reauth_url.
+  // reauth_required: the refresh token expired or was revoked. Events already synced are kept
+  // (and still shown), but syncing is paused until the user signs in again via reauth_url.
   status: "active" | "reauth_required" | "removing" | "error";
   tenant: { id: string; display_name: string; tenant_id: string | null };
   last_synced_at: string | null;
@@ -46,7 +43,6 @@ export interface CalendarEvent {
   show_as: string;
   labels: string[];
   source_ids: string[];
-  mirrored: boolean;
 }
 
 export interface Tenant {
@@ -70,11 +66,8 @@ export interface AdminUser {
   email: string;
   display_name: string;
   is_operator: boolean;
-  primary_status: PrimaryStatus;
-  primary_mailbox: string | null;
-  primary_error: string | null;
   source_count: number;
-  mirror_count: number;
+  event_count: number;
   created_at: string;
 }
 
@@ -120,7 +113,7 @@ export interface Overview {
   subscriptions_expiring_24h: number;
   subscriptions_failing: number;
   errors_24h: number;
-  mirrors: number;
+  events: number;
 }
 
 export class ApiError extends Error {

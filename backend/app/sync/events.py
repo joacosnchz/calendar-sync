@@ -1,6 +1,8 @@
-"""Normalising Graph events into the minimal fields we store."""
+"""Normalising Graph events into the minimal fields we store, and how copies of one
+meeting combine in the unified calendar."""
 
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -9,7 +11,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from tzlocal.windows_tz import win_tz
 
-MIRRORABLE_TYPES = {"singleInstance", "occurrence", "exception"}
+STORED_TYPES = {"singleInstance", "occurrence", "exception"}
+
+# When one meeting is in several sources, the busiest show-as wins (FR-10).
+SHOW_AS_RANK = {"free": 0, "unknown": 0, "workingElsewhere": 1, "tentative": 2, "busy": 3, "oof": 4}
+
+
+def busiest(show_as: Iterable[str]) -> str:
+    return max(show_as, key=lambda s: SHOW_AS_RANK.get(s, 3))
 
 
 @lru_cache(maxsize=512)
@@ -65,8 +74,8 @@ class NormalizedEvent:
     def overlaps(self, start: datetime, end: datetime) -> bool:
         return self.start_utc < end and self.end_utc > start
 
-    def is_mirrorable(self) -> bool:
-        return self.event_type in MIRRORABLE_TYPES and not self.is_cancelled
+    def should_store(self) -> bool:
+        return self.event_type in STORED_TYPES and not self.is_cancelled
 
 
 def parse_all_day(value: dict[str, str]) -> datetime:
@@ -99,7 +108,7 @@ def normalize_event(raw: dict[str, Any]) -> NormalizedEvent:
 
 def dedup_key_for(source_id: uuid.UUID, event: NormalizedEvent) -> str:
     # iCalUId is shared by every copy of a meeting (and is distinct per occurrence), so
-    # one meeting that appears in two of a user's sources collapses to one mirror (FR-14).
+    # one meeting that appears in two of a user's sources shows once (FR-14).
     if event.ical_uid:
         return f"ical:{event.ical_uid}"
     return f"src:{source_id}:{event.graph_event_id}"

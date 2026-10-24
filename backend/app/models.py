@@ -41,21 +41,14 @@ class TimestampMixin:
 class SourceStatus:
     ACTIVE = "active"
     # The delegated grant stopped working (refresh token expired or revoked, MFA or
-    # consent now required, password reset...). Syncing is paused and existing mirrors
-    # are kept until the user signs in again (Reconnect).
+    # consent now required, password reset...). Syncing is paused and stored events stay
+    # in the unified calendar until the user signs in again (Reconnect).
     REAUTH_REQUIRED = "reauth_required"
     REMOVING = "removing"
     ERROR = "error"
 
-    # Sources whose stored events still back mirrors in the primary calendar.
-    MIRRORED = (ACTIVE, REAUTH_REQUIRED)
-
-
-class PrimaryStatus:
-    UNASSIGNED = "unassigned"  # user_mailbox mode, waiting for an operator
-    PROVISIONING = "provisioning"
-    READY = "ready"
-    ERROR = "error"
+    # Sources whose stored events appear in the unified calendar.
+    VISIBLE = (ACTIVE, REAUTH_REQUIRED)
 
 
 class SubscriptionStatus:
@@ -78,12 +71,6 @@ class User(TimestampMixin, Base):
     login_object_id: Mapped[str] = mapped_column(String(64))
     is_operator: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    # Primary calendar in our tenant.
-    primary_mailbox: Mapped[str | None] = mapped_column(String(320))
-    primary_calendar_id: Mapped[str | None] = mapped_column(Text)
-    primary_status: Mapped[str] = mapped_column(String(32), default=PrimaryStatus.UNASSIGNED)
-    primary_error: Mapped[str | None] = mapped_column(Text)
-
     sources: Mapped[list["LinkedSource"]] = relationship(back_populates="user", passive_deletes=True)
 
 
@@ -95,7 +82,8 @@ class Tenant(TimestampMixin, Base):
     tenant_id: Mapped[str | None] = mapped_column(String(64), unique=True)
     display_name: Mapped[str] = mapped_column(String(256))
     domain: Mapped[str | None] = mapped_column(String(256))
-    # Per-customer privacy control: when false, mirrors show "Busy" with no subject/location.
+    # Per-customer privacy control: when false, its events show as "Busy" with no
+    # subject/location in the unified calendar.
     copy_details: Mapped[bool] = mapped_column(Boolean, default=True)
     last_error: Mapped[str | None] = mapped_column(Text)
 
@@ -157,7 +145,8 @@ class Subscription(TimestampMixin, Base):
 
 
 class SourceEvent(Base):
-    """An event occurrence read from a source calendar. Only fields the mirror needs are kept."""
+    """An event occurrence read from a source calendar. Only the fields the unified calendar
+    shows are kept (never attendees or body)."""
 
     __tablename__ = "source_events"
     __table_args__ = (
@@ -170,7 +159,7 @@ class SourceEvent(Base):
     source_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("linked_sources.id", ondelete="CASCADE"))
     graph_event_id: Mapped[str] = mapped_column(Text)
     ical_uid: Mapped[str | None] = mapped_column(Text)
-    # iCalUId when present (same meeting in two sources mirrors once), else source+event id.
+    # iCalUId when present (same meeting in two sources shows once), else source+event id.
     dedup_key: Mapped[str] = mapped_column(Text)
     event_type: Mapped[str] = mapped_column(String(32), default="singleInstance")
     series_master_id: Mapped[str | None] = mapped_column(Text)
@@ -185,26 +174,6 @@ class SourceEvent(Base):
     sensitivity: Mapped[str] = mapped_column(String(32), default="normal")
     last_modified: Mapped[datetime | None]
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
-
-
-class MirrorMapping(Base):
-    """Source event key (user + dedup key) -> mirrored event in the user's primary calendar."""
-
-    __tablename__ = "mirror_mappings"
-    __table_args__ = (UniqueConstraint("user_id", "dedup_key"),)
-
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=_uuid)
-    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    dedup_key: Mapped[str] = mapped_column(Text)
-    primary_mailbox: Mapped[str | None] = mapped_column(String(320))
-    primary_calendar_id: Mapped[str | None] = mapped_column(Text)
-    graph_event_id: Mapped[str | None] = mapped_column(Text)
-    # Sent as the event's transactionId so a retried create never makes a second mirror.
-    pending_transaction_id: Mapped[str | None] = mapped_column(String(64))
-    content_hash: Mapped[str | None] = mapped_column(String(64))
-    last_written_at: Mapped[datetime | None]
-    reconciled_at: Mapped[datetime | None]
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
 class SyncError(Base):

@@ -11,15 +11,15 @@ import { useResource } from "@/lib/hooks";
 const STEPS = [
   {
     title: "Sign in",
-    body: "Sign in with any work account. We create your unified calendar in Microsoft 365.",
+    body: "Sign in with any Microsoft work account. There's nothing to install or set up.",
   },
   {
     title: "Link your calendars",
     body: "Sign in with the work account you use at each organization and approve read-only calendar access yourself.",
   },
   {
-    title: "See everything in Outlook",
-    body: "Meetings from every organization appear in one calendar within seconds, with free/busy intact.",
+    title: "See everything in one calendar",
+    body: "Meetings from all your linked accounts come together in one calendar here within seconds, with free/busy intact.",
   },
 ];
 
@@ -29,7 +29,7 @@ export default function Landing() {
   const me = useResource<Me>("/api/me", undefined, { anonymous: true });
 
   useEffect(() => {
-    if (me.data) router.replace("/dashboard");
+    if (me.data) router.replace("/calendar");
   }, [me.data, router]);
 
   return (
@@ -44,10 +44,11 @@ export default function Landing() {
           </h1>
           <p className="mt-5 text-lg text-slate-600">
             Consultants, board members and agency teams keep a calendar in every organization they work with.
-            Calendar Sync mirrors them all into a single calendar, so you never double-book again.
+            Calendar Sync brings the calendars of all your linked Microsoft 365 accounts together in one calendar, so
+            you never double-book again.
           </p>
           <div className="mt-8 flex items-center gap-4">
-            <LinkButton href="/auth/login?next=/dashboard">
+            <LinkButton href="/auth/login?next=/calendar">
               <MicrosoftMark /> Sign in with Microsoft
             </LinkButton>
             <span className="text-sm text-slate-500">Read-only access to your source calendars.</span>

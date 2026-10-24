@@ -14,22 +14,19 @@ import httpx
 from arq import Retry
 from arq.connections import ArqRedis
 from cryptography.fernet import Fernet
-from sqlalchemy import select
+from sqlalchemy import MetaData, select
 
 from app.api.deps import CSRF_HEADER
 from app.api.main import create_app
 from app.config import Settings
-from app.models import Base, LinkedSource, MirrorMapping, SourceEvent, Subscription, User
+from app.models import Base, LinkedSource, SourceEvent, Subscription, User
 from app.queue import JobQueue
 from app.services import Services
 from app.worker.jobs import JOB_FUNCTIONS
 from mockgraph.main import create_mock_app
 from mockgraph.state import MockState, MockUser, now_utc, seed
 
-HOME_TENANT = "11111111-1111-4111-8111-111111111111"
 SOURCE_APP = "22222222-2222-4222-8222-222222222222"
-PRIMARY_APP = "33333333-3333-4333-8333-333333333333"
-SHARED_MAILBOX = "calendars@calsync.example"
 
 JOBS = {f.__name__: f for f in JOB_FUNCTIONS}
 
@@ -47,13 +44,8 @@ def make_settings(**overrides: Any) -> Settings:
         graph_base_url="http://graph.test/v1.0",
         session_secret="test-session-secret-" + "x" * 40,
         data_encryption_keys=Fernet.generate_key().decode(),
-        home_tenant_id=HOME_TENANT,
         source_app_client_id=SOURCE_APP,
         source_app_client_secret="source-secret",
-        primary_app_client_id=PRIMARY_APP,
-        primary_app_client_secret="primary-secret",
-        primary_calendar_mode="shared_mailbox",
-        primary_shared_mailbox=SHARED_MAILBOX,
         operator_emails="ops@calsync.example",
     )
     values.update(overrides)
@@ -182,17 +174,22 @@ class Harness:
 
     # -- inspection -------------------------------------------------------------------
 
-    def primary_events(self) -> list[dict[str, Any]]:
-        shared = self.mock.user_by_upn(SHARED_MAILBOX)
-        return [
-            ev
-            for cal in self.mock.calendars.values()
-            if cal.owner_oid == shared.oid and cal.id != shared.default_calendar_id
-            for ev in cal.events.values()
-        ]
+    @staticmethod
+    async def calendar(browser: httpx.AsyncClient, days: int = 60) -> list[dict[str, Any]]:
+        """The user's unified calendar from yesterday to `days` ahead (GET /api/calendar)."""
+        now = now_utc()
+        resp = await browser.get(
+            "/api/calendar",
+            params={
+                "start": (now - timedelta(days=1)).isoformat(),
+                "end": (now + timedelta(days=days)).isoformat(),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()
 
-    def primary_subjects(self) -> list[str]:
-        return sorted(ev["subject"] for ev in self.primary_events())
+    async def subjects(self, browser: httpx.AsyncClient) -> list[str]:
+        return sorted(e["subject"] for e in await self.calendar(browser))
 
     async def user(self, email: str) -> User:
         async with self.services.sessionmaker() as session:
@@ -213,10 +210,6 @@ class Harness:
     async def source_event_count(self) -> int:
         async with self.services.sessionmaker() as session:
             return len((await session.scalars(select(SourceEvent.id))).all())
-
-    async def mapping_count(self) -> int:
-        async with self.services.sessionmaker() as session:
-            return len((await session.scalars(select(MirrorMapping.id))).all())
 
     async def create_source_event(
         self, upn: str, subject: str, *, hours_from_now: float = 24, **extra: Any
@@ -240,12 +233,8 @@ async def build_harness(settings: Settings, redis: ArqRedis) -> Harness:
     queue = RecordingQueue(redis)
     services = await Services.create(settings, redis=redis, http_transport=router, queue=queue)
     mock = MockState(
-        home_tenant_id=HOME_TENANT,
         source_app_id=SOURCE_APP,
         source_app_secret="source-secret",
-        primary_app_id=PRIMARY_APP,
-        primary_app_secret="primary-secret",
-        shared_mailbox=SHARED_MAILBOX,
         inline_delivery=True,
         notify_transport=router,
     )
@@ -261,9 +250,17 @@ async def build_harness(settings: Settings, redis: ArqRedis) -> Harness:
         }
     )
     async with services.engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-        await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_reset_schema)
     return Harness(settings, services, queue, mock, router, api_transport, mock_transport)
+
+
+def _reset_schema(conn) -> None:
+    # Drop what is actually there, so tables a test database kept from an older schema
+    # (e.g. mirror_mappings) don't block dropping the current ones.
+    existing = MetaData()
+    existing.reflect(conn)
+    existing.drop_all(conn)
+    Base.metadata.create_all(conn)
 
 
 def tenant_of(mock: MockState, upn: str) -> str:

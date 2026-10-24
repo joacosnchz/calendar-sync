@@ -1,11 +1,12 @@
 """End-to-end flows through API, queue, workers and mock Graph."""
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from prometheus_client import REGISTRY
 from sqlalchemy import select, text, update
 
-from app.models import LinkedSource, SourceStatus, Subscription, Tenant
+from app.models import LinkedSource, SourceEvent, SourceStatus, Subscription, Tenant, User
 from app.timeutil import utcnow
 from app.worker import sweeps
 from mockgraph.state import b64
@@ -18,14 +19,18 @@ async def link_and_sync(h: Harness, browser, upn: str) -> dict:
     return result
 
 
+def at(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
 async def test_link_stores_refresh_token_and_backfills_without_admin_consent(harness: Harness, alice):
     h = harness
-    user = await h.user("alice@contoso.example")
-    assert user.primary_status == "ready"
-    assert user.primary_mailbox == "calendars@calsync.example"
-
     await h.create_source_event(
-        "alice@contoso.example", "Existing meeting", location={"displayName": "Room 7"}
+        "alice@contoso.example",
+        "Existing meeting",
+        location={"displayName": "Room 7"},
+        attendees=[{"emailAddress": {"address": "bob@contoso.example"}}],
+        body={"contentType": "text", "content": "Agenda"},
     )
 
     # Alice consents for her own mailbox: no tenant onboarding, no admin involved.
@@ -56,10 +61,22 @@ async def test_link_stores_refresh_token_and_backfills_without_admin_consent(har
     assert sub.resource == f"users/{owner.oid}/events"
     assert sub.creator_oid == owner.oid  # created with Alice's delegated token
     assert sub.change_types == {"created", "updated", "deleted"}
-    assert h.primary_subjects() == ["[Contoso] Existing meeting"]
-    mirror = h.primary_events()[0]
-    assert mirror["attendees"] == []
-    assert mirror["location"]["displayName"] == "Room 7"
+    [event] = await h.calendar(alice)
+    assert event["subject"] == "Existing meeting" and event["location"] == "Room 7"
+    assert event["labels"] == ["Contoso"] and event["source_ids"] == [str(source.id)]
+    assert set(event) == {
+        "key",
+        "subject",
+        "location",
+        "start",
+        "end",
+        "is_all_day",
+        "show_as",
+        "labels",
+        "source_ids",
+    }
+    # FR-9: attendees and body are never stored.
+    assert not {"attendees", "body"} & set(SourceEvent.__table__.columns.keys())
 
     [out] = (await alice.get("/api/sources")).json()
     assert out["status"] == "active"
@@ -78,9 +95,9 @@ async def test_notifications_create_update_delete(harness: Harness, operator, al
 
     created = await h.create_source_event(upn, "Kickoff", showAs="tentative")
     assert h.queue.names() == ["process_notification"]
-    await h.run_jobs()
-    assert h.primary_subjects() == ["[Contoso] Kickoff"]
-    assert h.primary_events()[0]["showAs"] == "tentative"
+    assert await h.run_jobs() == [("process_notification", "changed=1 delta=False")]
+    [event] = await h.calendar(alice)
+    assert event["subject"] == "Kickoff" and event["show_as"] == "tentative"
 
     moved_start = (utcnow() + timedelta(days=2)).replace(minute=0, second=0, microsecond=0)
     await h.mock.update_event(
@@ -96,20 +113,21 @@ async def test_notifications_create_update_delete(harness: Harness, operator, al
         },
     )
     await h.run_jobs()
-    [mirror] = h.primary_events()
-    assert mirror["subject"] == "[Contoso] Kickoff (moved)"
-    assert mirror["start"]["dateTime"].startswith(moved_start.strftime("%Y-%m-%dT%H:%M"))
+    [event] = await h.calendar(alice)
+    assert event["subject"] == "Kickoff (moved)"
+    assert at(event["start"]) == moved_start and at(event["end"]) == moved_start + timedelta(hours=1)
 
     await h.mock.update_event(owner, created["id"], {"isCancelled": True})
     await h.run_jobs()
-    assert h.primary_events() == []
+    assert await h.calendar(alice) == []
 
     second = await h.create_source_event(upn, "Standup")
     await h.run_jobs()
+    assert await h.subjects(alice) == ["Standup"]
     await h.mock.delete_event(owner, second["id"])
     await h.run_jobs()
-    assert h.primary_events() == []
-    assert await h.mapping_count() == 0
+    assert await h.calendar(alice) == []
+    assert await h.source_event_count() == 0
 
 
 async def test_duplicate_and_stale_notifications_are_harmless(harness: Harness, operator, alice):
@@ -124,9 +142,9 @@ async def test_duplicate_and_stale_notifications_are_harmless(harness: Harness, 
     await h.run_jobs()
     # Re-delivery after processing re-fetches but writes nothing new.
     await sub_notify(h, sub, event["id"])
-    await h.run_jobs()
-    assert h.primary_subjects() == ["[Contoso] Once"]
-    assert len(h.primary_events()) == 1
+    assert await h.run_jobs() == [("process_notification", "changed=0 delta=False")]
+    assert await h.subjects(alice) == ["Once"]
+    assert await h.source_event_count() == 1
 
 
 async def sub_notify(h: Harness, sub, event_id: str) -> None:
@@ -149,7 +167,7 @@ async def sub_notify(h: Harness, sub, event_id: str) -> None:
     assert resp.status_code == 202
 
 
-async def test_same_meeting_in_two_sources_is_mirrored_once(harness: Harness, operator, alice):
+async def test_same_meeting_in_two_sources_shows_once(harness: Harness, operator, alice):
     h = harness
     await link_and_sync(h, alice, "alice@contoso.example")
     await link_and_sync(h, alice, "alice@fabrikam.example")
@@ -157,51 +175,49 @@ async def test_same_meeting_in_two_sources_is_mirrored_once(harness: Harness, op
     original = await h.create_source_event("alice@contoso.example", "Partnership", showAs="tentative")
     await h.create_source_event("alice@fabrikam.example", "Partnership", ical_uid=original["iCalUId"])
     await h.run_jobs()
-    assert h.primary_subjects() == ["[Contoso · Fabrikam] Partnership"]
-    assert h.primary_events()[0]["showAs"] == "busy"
-
-    calendar = (
-        await alice.get(
-            "/api/calendar",
-            params={"start": utcnow().isoformat(), "end": (utcnow() + timedelta(days=7)).isoformat()},
-        )
-    ).json()
-    assert len(calendar) == 1 and calendar[0]["labels"] == ["Contoso", "Fabrikam"] and calendar[0]["mirrored"]
+    assert await h.source_event_count() == 2
+    sources = {s["source_email"]: s for s in (await alice.get("/api/sources")).json()}
+    # FR-14: one entry for both copies; FR-10: the busiest show-as wins.
+    [event] = await h.calendar(alice)
+    assert event["subject"] == "Partnership" and event["key"] == f"ical:{original['iCalUId']}"
+    assert event["labels"] == ["Contoso", "Fabrikam"] and event["show_as"] == "busy"
+    assert sorted(event["source_ids"]) == sorted(s["id"] for s in sources.values())
 
     # Unlinking one source keeps the meeting (still in the other) and relabels it.
-    sources = {s["source_email"]: s for s in (await alice.get("/api/sources")).json()}
     resp = await alice.delete(f"/api/sources/{sources['alice@fabrikam.example']['id']}")
     assert resp.status_code == 202
     await h.run_jobs()
-    assert h.primary_subjects() == ["[Contoso] Partnership"]
+    [event] = await h.calendar(alice)
+    assert event["labels"] == ["Contoso"] and event["show_as"] == "tentative"
+    assert event["source_ids"] == [sources["alice@contoso.example"]["id"]]
     assert len(h.mock.subscriptions) == 1
     assert [s["source_email"] for s in (await alice.get("/api/sources")).json()] == ["alice@contoso.example"]
 
 
-async def test_unlink_removes_all_mirrors_and_data(harness: Harness, operator, alice):
+async def test_unlink_removes_the_sources_events_and_data(harness: Harness, operator, alice):
     h = harness
     await h.create_source_event("alice@contoso.example", "A")
     await h.create_source_event("alice@contoso.example", "B", hours_from_now=48)
     await link_and_sync(h, alice, "alice@contoso.example")
-    assert len(h.primary_events()) == 2
+    assert await h.subjects(alice) == ["A", "B"]
 
     [source] = (await alice.get("/api/sources")).json()
     await alice.delete(f"/api/sources/{source['id']}")
-    await h.run_jobs()
-    assert h.primary_events() == []
+    # Hidden from the calendar as soon as the unlink is requested (status "removing").
+    assert await h.calendar(alice) == []
+    assert await h.run_jobs() == [("remove_source", "purged events=2")]
     assert h.mock.subscriptions == {}  # deleted remotely with Alice's token
     assert await h.source_event_count() == 0
-    assert await h.mapping_count() == 0
     async with h.services.sessionmaker() as session:
         assert (await session.scalars(select(LinkedSource.id))).all() == []
     assert not await h.services.redis.exists(f"token:source:{source['id']}")
 
 
 async def _paused_by_revocation(h: Harness, alice) -> LinkedSource:
-    """Alice's Contoso source, synced with one mirror, then her refresh tokens revoked."""
+    """Alice's Contoso source, synced with one event, then her refresh tokens revoked."""
     await h.create_source_event("alice@contoso.example", "Board prep")
     await link_and_sync(h, alice, "alice@contoso.example")
-    assert h.primary_subjects() == ["[Contoso] Board prep"]
+    assert await h.subjects(alice) == ["Board prep"]
     # Revoked sessions (password reset, admin revocation...): Graph asks us to
     # reauthorize the delegated subscription, and refreshing the token fails.
     await h.mock.revoke_user(h.mock.user_by_upn("alice@contoso.example"))
@@ -210,14 +226,14 @@ async def _paused_by_revocation(h: Harness, alice) -> LinkedSource:
     return await h.source("alice@contoso.example")
 
 
-async def test_revoked_refresh_token_marks_reauth_required_and_keeps_mirrors(harness: Harness, alice):
+async def test_revoked_refresh_token_marks_reauth_required_and_keeps_events(harness: Harness, alice):
     h = harness
     source = await _paused_by_revocation(h, alice)
     assert source.status == SourceStatus.REAUTH_REQUIRED
     assert source.reauth_required_at is not None
     assert "AADSTS700082" in source.last_error
-    # Nothing is deleted: mirrors, stored events and the subscription row stay.
-    assert h.primary_subjects() == ["[Contoso] Board prep"]
+    # Nothing is deleted: stored events (still in the calendar) and the subscription row stay.
+    assert await h.subjects(alice) == ["Board prep"]
     assert await h.source_event_count() == 1
     assert len(await h.subscription_ids()) == 1
     assert not await h.services.redis.exists(f"token:source:{source.id}")
@@ -226,8 +242,6 @@ async def test_revoked_refresh_token_marks_reauth_required_and_keeps_mirrors(har
     assert out["status"] == "reauth_required"
     assert out["reauth_url"] == f"/auth/reauth/{source.id}"
     assert out["reauth_required_at"] is not None and "AADSTS700082" in out["last_error"]
-    window = {"start": utcnow().isoformat(), "end": (utcnow() + timedelta(days=7)).isoformat()}
-    assert [e["subject"] for e in (await alice.get("/api/calendar", params=window)).json()] == ["Board prep"]
 
     async with h.services.sessionmaker() as session:
         from app.models import AuditLog, SyncError
@@ -236,7 +250,7 @@ async def test_revoked_refresh_token_marks_reauth_required_and_keeps_mirrors(har
         errors = (await session.scalars(select(SyncError.kind))).all()
         assert errors == ["source.reauth_required"]
 
-    # Paused sources are skipped by every sweep, and the mirror audit keeps their mirrors.
+    # Paused sources are skipped by every sweep and their events stay visible.
     async with h.services.sessionmaker() as session:
         await session.execute(
             update(LinkedSource).values(
@@ -248,9 +262,7 @@ async def test_revoked_refresh_token_marks_reauth_required_and_keeps_mirrors(har
     ctx = {"services": h.services}
     assert await sweeps.delta_sweep(ctx) == "queued=0"
     assert await sweeps.renew_sweep(ctx) == "renew=0 recreate=0"
-    await sweeps.mirror_audit_sweep(ctx)
-    await h.run_jobs()
-    assert h.primary_subjects() == ["[Contoso] Board prep"]
+    assert await h.subjects(alice) == ["Board prep"]
     # Resync is refused and direct jobs no-op without calling Graph.
     assert (await alice.post(f"/api/sources/{source.id}/resync")).status_code == 409
     await h.services.queue.enqueue("sync_source", str(source.id), "full")
@@ -275,7 +287,7 @@ async def test_reauth_reactivates_resubscribes_and_resyncs(harness: Harness, ali
     [old_sub] = await h.subscription_ids()
     await h.create_source_event("alice@contoso.example", "While paused")
     await h.run_jobs()
-    assert h.primary_subjects() == ["[Contoso] Board prep"]
+    assert await h.subjects(alice) == ["Board prep"]
 
     # Reconnect goes straight to Contoso's own login page with Alice's account pre-filled.
     start = await alice.get(f"/auth/reauth/{source.id}")
@@ -295,12 +307,12 @@ async def test_reauth_reactivates_resubscribes_and_resyncs(harness: Harness, ali
     assert any(name == "sync_source" and "changed=1" in str(r) for name, r in ran), ran
     [new_sub] = await h.subscription_ids()
     assert new_sub != old_sub and old_sub not in h.mock.subscriptions and new_sub in h.mock.subscriptions
-    assert h.primary_subjects() == ["[Contoso] Board prep", "[Contoso] While paused"]
+    assert await h.subjects(alice) == ["Board prep", "While paused"]
 
     # Notifications flow again on the new subscription.
     await h.create_source_event("alice@contoso.example", "After reconnect", hours_from_now=30)
     await h.run_jobs()
-    assert "[Contoso] After reconnect" in h.primary_subjects()
+    assert "After reconnect" in await h.subjects(alice)
     [out] = (await alice.get("/api/sources")).json()
     assert out["status"] == "active" and out["reauth_url"] is None
 
@@ -322,7 +334,6 @@ async def test_reauth_with_wrong_account_is_rejected(harness: Harness, alice):
 
     # Another platform user can't reconnect (or probe) Alice's source.
     bob = await h.sign_in("bob@contoso.example")
-    await h.run_jobs()
     resp = await bob.get(f"/auth/reauth/{source.id}")
     assert h.result_of(resp) == {"status": "error", "message": "Calendar not found"}
     await bob.aclose()
@@ -351,7 +362,7 @@ async def test_withdrawn_consent_marks_reauth_required(harness: Harness, alice):
     await h.run_jobs()
     source = await h.source("alice@contoso.example")
     assert source.status == SourceStatus.REAUTH_REQUIRED and "AADSTS65001" in source.last_error
-    assert h.primary_subjects() == ["[Contoso] Keep"]
+    assert await h.subjects(alice) == ["Keep"]
 
 
 async def test_graph_403_on_own_mailbox_marks_reauth_required(harness: Harness, alice):
@@ -382,7 +393,7 @@ async def test_paused_source_can_still_be_unlinked(harness: Harness, alice):
     source = await _paused_by_revocation(h, alice)
     assert (await alice.delete(f"/api/sources/{source.id}")).status_code == 202
     await h.run_jobs()
-    assert h.primary_events() == []
+    assert await h.calendar(alice) == []
     assert await h.source_event_count() == 0
     assert (await alice.get("/api/sources")).json() == []
 
@@ -396,11 +407,11 @@ async def test_missed_notifications_are_recovered_by_delta(harness: Harness, ope
     h.mock.tenants[tenant_id].drop_notifications = True
     await h.create_source_event("alice@contoso.example", "Lost in transit")
     await h.run_jobs()
-    assert h.primary_events() == []
+    assert await h.calendar(alice) == []
 
     await h.mock.send_lifecycle(tenant_id, "missed")
     await h.run_jobs()
-    assert h.primary_subjects() == ["[Contoso] Lost in transit"]
+    assert await h.subjects(alice) == ["Lost in transit"]
     drift_after = REGISTRY.get_sample_value("calsync_delta_drift_total", {"tenant": tenant_id})
     assert drift_after == drift_before + 1
 
@@ -417,7 +428,7 @@ async def test_subscription_removed_is_recreated(harness: Harness, operator, ali
 
     await h.create_source_event("alice@contoso.example", "After recreate")
     await h.run_jobs()
-    assert h.primary_subjects() == ["[Contoso] After recreate"]
+    assert await h.subjects(alice) == ["After recreate"]
 
 
 async def test_reauthorization_required(harness: Harness, operator, alice):
@@ -488,7 +499,7 @@ async def test_scheduled_delta_catches_silent_changes(harness: Harness, operator
         await session.commit()
     assert await sweeps.delta_sweep({"services": h.services}) == "queued=1"
     await h.run_jobs()
-    assert h.primary_subjects() == ["[Contoso] Silent"]
+    assert await h.subjects(alice) == ["Silent"]
 
     # A deletion that was never notified disappears on the next delta too.
     await h.mock.delete_event(h.mock.user_by_upn("alice@contoso.example"), event["id"])
@@ -497,7 +508,7 @@ async def test_scheduled_delta_catches_silent_changes(harness: Harness, operator
         await session.commit()
     await sweeps.delta_sweep({"services": h.services})
     await h.run_jobs()
-    assert h.primary_events() == []
+    assert await h.calendar(alice) == []
 
 
 async def test_rebaseline_full_delta_and_pagination(harness: Harness, operator, alice):
@@ -506,7 +517,7 @@ async def test_rebaseline_full_delta_and_pagination(harness: Harness, operator, 
     for i in range(5):
         await h.create_source_event("alice@contoso.example", f"Event {i}", hours_from_now=24 + i)
     await link_and_sync(h, alice, "alice@contoso.example")
-    assert len(h.primary_events()) == 5
+    assert len(await h.calendar(alice)) == 5
     sync_results = [r for name, r in h.results if name == "sync_source"]
     assert any("pages=3" in str(r) for r in sync_results)
 
@@ -514,7 +525,7 @@ async def test_rebaseline_full_delta_and_pagination(harness: Harness, operator, 
     assert (await alice.post(f"/api/sources/{source['id']}/resync")).status_code == 202
     ran = await h.run_jobs()
     assert ("sync_source", "pages=3 changed=0 full=True") in ran
-    assert len(h.primary_events()) == 5
+    assert len(await h.calendar(alice)) == 5
 
 
 async def test_expired_delta_token_rebaselines(harness: Harness, operator, alice):
@@ -536,7 +547,7 @@ async def test_expired_delta_token_rebaselines(harness: Harness, operator, alice
     await h.services.queue.enqueue("sync_source", source["id"], "recovery")
     ran = await h.run_jobs()
     assert any(name == "sync_source" and "full=True" in str(r) for name, r in ran)
-    assert h.primary_subjects() == ["[Contoso] After expiry"]
+    assert await h.subjects(alice) == ["After expiry"]
 
 
 async def test_throttling_defers_and_recovers(harness: Harness, operator, alice):
@@ -549,14 +560,14 @@ async def test_throttling_defers_and_recovers(harness: Harness, operator, alice)
     ran = await h.run_jobs()
     assert ("process_notification", "deferred") in ran
     assert await h.services.redis.exists(f"throttle:tenant:{tenant_id}")
-    assert h.primary_events() == []
+    assert await h.calendar(alice) == []
 
     await h.release_deferred()
     await h.run_jobs()
-    assert h.primary_subjects() == ["[Contoso] Busy tenant"]
+    assert await h.subjects(alice) == ["Busy tenant"]
 
 
-async def test_time_zone_preserved_on_mirror(harness: Harness, operator, alice):
+async def test_time_zone_converted_for_the_calendar(harness: Harness, operator, alice):
     h = harness
     await link_and_sync(h, alice, "alice@contoso.example")
     day = (utcnow() + timedelta(days=3)).strftime("%Y-%m-%d")
@@ -569,40 +580,77 @@ async def test_time_zone_preserved_on_mirror(harness: Harness, operator, alice):
         },
     )
     await h.run_jobs()
-    [mirror] = h.primary_events()
-    assert mirror["originalStartTimeZone"] == "Pacific Standard Time"
-    source = next(
-        ev
-        for cal in h.mock.calendars.values()
-        for ev in cal.events.values()
-        if ev["subject"] == "West coast call"
-    )
-    assert mirror["start"] == source["start"]
+    [event] = await h.calendar(alice)
+    expected = datetime.fromisoformat(f"{day}T09:00:00").replace(tzinfo=ZoneInfo("America/Los_Angeles"))
+    assert at(event["start"]) == expected.astimezone(UTC)
+    assert at(event["end"]) == expected.astimezone(UTC) + timedelta(hours=1)
+    async with h.services.sessionmaker() as session:
+        stored = await session.scalar(select(SourceEvent))
+        assert stored.start_tz == "Pacific Standard Time"
 
 
-async def test_privacy_mode_mirrors_busy_only(harness: Harness, operator, alice):
+async def test_all_day_event_keeps_its_date(harness: Harness, operator, alice):
     h = harness
-    await h.create_source_event("alice@contoso.example", "Secret merger", location={"displayName": "Vault"})
     await link_and_sync(h, alice, "alice@contoso.example")
-    assert h.primary_subjects() == ["[Contoso] Secret merger"]
+    day = (utcnow() + timedelta(days=4)).date()
+    await h.mock.create_event(
+        h.mock.user_by_upn("alice@contoso.example"),
+        {
+            "subject": "Offsite",
+            "isAllDay": True,
+            "start": {"dateTime": f"{day}T00:00:00", "timeZone": "Pacific Standard Time"},
+            "end": {"dateTime": f"{day + timedelta(days=1)}T00:00:00", "timeZone": "Pacific Standard Time"},
+        },
+    )
+    await h.run_jobs()
+    [event] = await h.calendar(alice)
+    assert event["is_all_day"] and at(event["start"]).date() == day
 
+
+async def test_privacy_mode_shows_busy_only(harness: Harness, operator, alice):
+    h = harness
+    secret = await h.create_source_event(
+        "alice@contoso.example", "Secret merger", location={"displayName": "Vault"}
+    )
+    await link_and_sync(h, alice, "alice@contoso.example")
+    assert await h.subjects(alice) == ["Secret merger"]
+
+    # "Hide details" applies as soon as it's set: the calendar reads it every time.
     [tenant] = (await operator.get("/api/admin/tenants")).json()
     resp = await operator.patch(f"/api/admin/tenants/{tenant['id']}", json={"copy_details": False})
-    assert resp.status_code == 200
+    assert resp.status_code == 200 and resp.json()["copy_details"] is False
+    assert h.queue.jobs == []
+    [event] = await h.calendar(alice)
+    assert event["subject"] == "Busy" and event["location"] == "" and event["labels"] == ["Contoso"]
+
+    # The same meeting from a tenant that allows details still shows "Busy".
+    await link_and_sync(h, alice, "alice@fabrikam.example")
+    await h.create_source_event(
+        "alice@fabrikam.example",
+        "Secret merger",
+        location={"displayName": "Vault"},
+        ical_uid=secret["iCalUId"],
+    )
     await h.run_jobs()
-    assert h.primary_subjects() == ["[Contoso] Busy"]
-    assert h.primary_events()[0]["location"]["displayName"] == ""
+    [event] = await h.calendar(alice)
+    assert event["subject"] == "Busy" and event["labels"] == ["Contoso", "Fabrikam"]
+
+    await operator.patch(f"/api/admin/tenants/{tenant['id']}", json={"copy_details": True})
+    [event] = await h.calendar(alice)
+    assert event["subject"] == "Secret merger" and event["location"] == "Vault"
 
 
-async def test_label_rename_updates_mirrors(harness: Harness, operator, alice):
+async def test_label_rename_shows_in_calendar(harness: Harness, operator, alice):
     h = harness
     await h.create_source_event("alice@contoso.example", "Sync")
     await link_and_sync(h, alice, "alice@contoso.example")
     [source] = (await alice.get("/api/sources")).json()
     resp = await alice.patch(f"/api/sources/{source['id']}", json={"label": "Client A"})
     assert resp.status_code == 200
-    await h.run_jobs()
-    assert h.primary_subjects() == ["[Client A] Sync"]
+    assert resp.json()["label"] == "Client A" and resp.json()["event_count"] == 1
+    assert h.queue.jobs == []  # nothing to re-render
+    [event] = await h.calendar(alice)
+    assert event["labels"] == ["Client A"] and event["subject"] == "Sync"
 
 
 async def test_users_are_isolated(harness: Harness, operator, alice):
@@ -611,22 +659,30 @@ async def test_users_are_isolated(harness: Harness, operator, alice):
     await link_and_sync(h, alice, "alice@contoso.example")
 
     bob = await h.sign_in("bob@contoso.example")
-    await h.run_jobs()
     [alice_source] = (await alice.get("/api/sources")).json()
     assert (await bob.get("/api/sources")).json() == []
     assert (await bob.delete(f"/api/sources/{alice_source['id']}")).status_code == 404
     assert (await bob.patch(f"/api/sources/{alice_source['id']}", json={"label": "x"})).status_code == 404
-    window = {"start": utcnow().isoformat(), "end": (utcnow() + timedelta(days=7)).isoformat()}
-    assert (await bob.get("/api/calendar", params=window)).json() == []
+    assert await h.calendar(bob) == []
 
     # Bob can't link Alice's mailbox: linking requires signing in *as* that mailbox, and
-    # linking bob's own mailbox gives bob his own, separate mirrors.
+    # linking bob's own mailbox gives bob his own, separate calendar.
+    await h.create_source_event("bob@contoso.example", "Bob only")
     await link_and_sync(h, bob, "bob@contoso.example")
-    bob_user = await h.user("bob@contoso.example")
-    alice_user = await h.user("alice@contoso.example")
-    assert bob_user.primary_calendar_id != alice_user.primary_calendar_id
-    assert h.primary_subjects() == ["[Contoso] Alice only"]
+    assert await h.subjects(alice) == ["Alice only"]
+    assert await h.subjects(bob) == ["Bob only"]
     await bob.aclose()
+
+
+async def test_calendar_range_is_limited(harness: Harness, alice):
+    now = utcnow()
+    for start, end in ((now, now - timedelta(hours=1)), (now, now + timedelta(days=63))):
+        resp = await alice.get("/api/calendar", params={"start": start.isoformat(), "end": end.isoformat()})
+        assert resp.status_code == 400
+    resp = await alice.get(
+        "/api/calendar", params={"start": now.isoformat(), "end": (now + timedelta(days=62)).isoformat()}
+    )
+    assert resp.status_code == 200 and resp.json() == []
 
 
 async def test_source_calendars_are_never_written(harness: Harness, operator, alice):
@@ -655,11 +711,6 @@ async def test_source_calendars_are_never_written(harness: Harness, operator, al
     assert len(after) == len(before) + 1
 
 
-async def test_host_tenant_cannot_be_linked(harness: Harness, operator):
-    result = await harness.link(operator, "ops@calsync.example")
-    assert result["status"] == "error"
-
-
 async def test_blocked_user_consent_maps_to_admin_approval_required(harness: Harness, alice):
     h = harness
     h.mock.tenants[tenant_of(h.mock, "alice@contoso.example")].user_consent_blocked = True
@@ -683,39 +734,33 @@ async def test_account_deletion_removes_everything(harness: Harness, operator, a
     h = harness
     await h.create_source_event("alice@contoso.example", "Bye")
     await link_and_sync(h, alice, "alice@contoso.example")
-    calendar_id = (await h.user("alice@contoso.example")).primary_calendar_id
-    assert calendar_id in h.mock.calendars
+    await link_and_sync(h, alice, "alice@fabrikam.example")
+    sources = [s["id"] for s in (await alice.get("/api/sources")).json()]
 
     assert (await alice.delete("/api/me")).status_code == 202
-    await h.run_jobs()
-    assert calendar_id not in h.mock.calendars
+    assert await h.run_jobs() == [("delete_user", "deleted")]
     assert h.mock.subscriptions == {}
     assert await h.source_event_count() == 0
+    async with h.services.sessionmaker() as session:
+        assert (await session.scalars(select(LinkedSource.id))).all() == []
+        assert (await session.scalars(select(User.email))).all() == ["ops@calsync.example"]
+    for source_id in sources:
+        assert not await h.services.redis.exists(f"token:source:{source_id}")
     assert (await alice.get("/api/me")).status_code == 401
-
-
-async def test_mirror_audit_repairs_deleted_mirror(harness: Harness, operator, alice):
-    h = harness
-    await h.create_source_event("alice@contoso.example", "Keep me")
-    await link_and_sync(h, alice, "alice@contoso.example")
-    [mirror] = h.primary_events()
-
-    # Someone deletes the mirror in Outlook. An operator rebuild restores it.
-    await h.mock.delete_event(h.mock.user_by_upn("calendars@calsync.example"), mirror["id"])
-    user = await h.user("alice@contoso.example")
-    assert (await operator.post(f"/api/admin/users/{user.id}/rebuild")).status_code == 202
-    await h.run_jobs()
-    assert h.primary_subjects() == ["[Contoso] Keep me"]
 
 
 async def test_admin_health_views(harness: Harness, operator, alice):
     h = harness
     await link_and_sync(h, alice, "alice@contoso.example")
+    await h.create_source_event("alice@contoso.example", "One")
+    await h.create_source_event("alice@contoso.example", "Two", hours_from_now=30)
+    await h.run_jobs()
     overview = (await operator.get("/api/admin/overview")).json()
     assert overview["users"] == 2
     assert overview["tenants"] == 1
     assert overview["sources"] == {SourceStatus.ACTIVE: 1}
     assert overview["subscriptions"] == 1
+    assert overview["events"] == 2 and "mirrors" not in overview
     [tenant] = (await operator.get("/api/admin/tenants")).json()
     assert tenant["active_source_count"] == 1 and tenant["next_subscription_expiry"]
     assert tenant["source_count"] == 1 and tenant["reauth_required_count"] == 0
@@ -742,23 +787,37 @@ async def test_admin_health_views(harness: Harness, operator, alice):
     assert overview["sources"] == {SourceStatus.REAUTH_REQUIRED: 1}
 
 
-async def test_user_mailbox_mode(harness: Harness):
+async def test_admin_users(harness: Harness, operator, alice):
     h = harness
-    h.settings.primary_calendar_mode = "user_mailbox"
-    operator = await h.sign_in("ops@calsync.example")
-    alice = await h.sign_in("alice@contoso.example")
-    await h.run_jobs()
-    me = (await alice.get("/api/me")).json()
-    assert me["primary"]["status"] == "unassigned"
+    await h.create_source_event("alice@contoso.example", "Contoso event")
+    await h.create_source_event("alice@fabrikam.example", "Fabrikam event")
+    await link_and_sync(h, alice, "alice@contoso.example")
+    await link_and_sync(h, alice, "alice@fabrikam.example")
 
-    user = await h.user("alice@contoso.example")
-    resp = await operator.patch(
-        f"/api/admin/users/{user.id}", json={"primary_mailbox": "calendars@calsync.example"}
-    )
-    assert resp.status_code == 202
-    await h.run_jobs()
-    user = await h.user("alice@contoso.example")
-    assert user.primary_status == "ready"
-    assert user.primary_calendar_id == h.mock.user_by_upn("calendars@calsync.example").default_calendar_id
-    await operator.aclose()
-    await alice.aclose()
+    users = {u["email"]: u for u in (await operator.get("/api/admin/users")).json()}
+    assert set(users["alice@contoso.example"]) == {
+        "id",
+        "email",
+        "display_name",
+        "is_operator",
+        "source_count",
+        "event_count",
+        "created_at",
+    }
+    assert users["alice@contoso.example"]["source_count"] == 2
+    assert users["alice@contoso.example"]["event_count"] == 2
+    assert users["ops@calsync.example"]["event_count"] == 0 and users["ops@calsync.example"]["is_operator"]
+
+    alice_id = users["alice@contoso.example"]["id"]
+    resp = await operator.patch(f"/api/admin/users/{alice_id}", json={"is_operator": True})
+    assert resp.status_code == 202 and resp.json() == {"status": "updated"}
+    assert (await alice.get("/api/me")).json()["is_operator"] is True
+    ops_id = users["ops@calsync.example"]["id"]
+    assert (
+        await operator.patch(f"/api/admin/users/{ops_id}", json={"is_operator": False})
+    ).status_code == 400
+    assert (await alice.get("/api/admin/users")).status_code == 200
+
+    # The primary-calendar endpoints are gone.
+    assert (await operator.post(f"/api/admin/users/{alice_id}/provision")).status_code == 404
+    assert (await operator.post(f"/api/admin/users/{alice_id}/rebuild")).status_code == 404

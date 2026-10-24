@@ -24,8 +24,8 @@ export function Logo() {
 }
 
 const NAV = [
-  { href: "/dashboard", label: "Accounts" },
   { href: "/calendar", label: "Calendar" },
+  { href: "/dashboard", label: "Accounts" },
 ];
 
 export function AppShell({
@@ -55,7 +55,7 @@ export function AppShell({
     <div className="min-h-screen">
       <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/90 backdrop-blur">
         <div className="mx-auto flex h-14 max-w-6xl items-center gap-6 px-4">
-          <Link href="/dashboard">
+          <Link href="/calendar">
             <Logo />
           </Link>
           <nav className="flex items-center gap-1">

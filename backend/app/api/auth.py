@@ -28,7 +28,7 @@ from app.graph.oidc import (
     exchange_code,
     needs_admin_approval,
 )
-from app.models import LinkedSource, PrimaryStatus, SourceStatus, Tenant, User
+from app.models import LinkedSource, SourceStatus, Tenant, User
 from app.security import (
     OAUTH_COOKIE,
     SESSION_COOKIE,
@@ -67,7 +67,7 @@ def _start(
     *,
     purpose: str,
     user: User | None = None,
-    next_path: str = "/dashboard",
+    next_path: str = "/calendar",
     source: LinkedSource | None = None,
 ) -> Response:
     settings = services.settings
@@ -195,7 +195,7 @@ async def callback(
         return _error(services, str(exc))
 
     if purpose == "login":
-        resp = await _complete_login(services, session, result.identity, claims.get("next", "/dashboard"))
+        resp = await _complete_login(services, session, result.identity, claims.get("next", "/calendar"))
     elif purpose == "reauth" and reauth_source is not None:
         resp = await _complete_reauth(request, services, session, result, claims.get("uid"), reauth_source)
     else:
@@ -220,11 +220,6 @@ async def _complete_login(
             display_name=identity.name,
             login_tenant_id=identity.tenant_id,
             login_object_id=identity.object_id,
-            primary_status=(
-                PrimaryStatus.PROVISIONING
-                if settings.primary_calendar_mode == "shared_mailbox"
-                else PrimaryStatus.UNASSIGNED
-            ),
         )
         session.add(user)
     user.email, user.display_name = identity.email, identity.name
@@ -233,8 +228,6 @@ async def _complete_login(
     await session.flush()
     audit(session, "user.signed_up" if is_new else "user.signed_in", "user", user.id, actor=user)
     await session.commit()
-    if is_new and user.primary_status == PrimaryStatus.PROVISIONING:
-        await services.queue.enqueue("provision_primary", str(user.id))
 
     resp = RedirectResponse(_web(services, safe_next_path(next_path)), status_code=302)
     resp.set_cookie(
@@ -317,15 +310,11 @@ async def _complete_link(
     result: CodeExchange,
     state_uid: str | None,
 ) -> Response:
-    settings = services.settings
     user = await _session_user(request, services, session, state_uid)
     if isinstance(user, Response):
         return user
     identity = result.identity
 
-    if identity.tenant_id == settings.home_tenant_id:
-        # Primary calendars live in our tenant; linking it as a source would mirror mirrors.
-        return _error(services, "Accounts in the host tenant can't be linked")
     if problem := _grant_problem(result):
         return _error(services, problem)
 

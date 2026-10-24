@@ -74,5 +74,5 @@ def read_oauth_state(settings: Settings, token: str) -> dict[str, Any]:
 def safe_next_path(value: str | None) -> str:
     """Only allow same-site relative redirects."""
     if not value or not value.startswith("/") or value.startswith("//") or "\\" in value:
-        return "/dashboard"
+        return "/calendar"
     return value

@@ -64,7 +64,7 @@ export function useMe(options: { requireOperator?: boolean } = {}) {
   const forbidden = options.requireOperator && me.data && !me.data.is_operator;
 
   useEffect(() => {
-    if (forbidden) router.replace("/dashboard");
+    if (forbidden) router.replace("/calendar");
   }, [forbidden, router]);
 
   return me;

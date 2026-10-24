@@ -35,7 +35,7 @@ function Admin({ me }: { me: Me }) {
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-semibold text-slate-900">Operations</h1>
-        <p className="mt-1 text-sm text-slate-600">Provision primary calendars, set tenant privacy and watch sync health.</p>
+        <p className="mt-1 text-sm text-slate-600">Manage operators, set tenant privacy and watch sync health.</p>
       </div>
 
       <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
@@ -50,7 +50,7 @@ function Admin({ me }: { me: Me }) {
           value={o?.subscriptions ?? "–"}
           hint={o ? `${o.subscriptions_failing} failing · ${o.subscriptions_expiring_24h} expire < 24h` : undefined}
         />
-        <Stat label="Errors (24h)" value={o?.errors_24h ?? "–"} hint={`${o?.mirrors ?? "–"} mirrored events`} />
+        <Stat label="Errors (24h)" value={o?.errors_24h ?? "–"} hint={`${o?.events ?? "–"} synced events`} />
       </div>
 
       <div className="flex gap-1 border-b border-slate-200">
@@ -165,7 +165,7 @@ function Tenants({ onChange }: { onChange: () => Promise<void> }) {
                 <Button
                   size="sm"
                   onClick={() => act(() => patch(`/api/admin/tenants/${t.id}`, { copy_details: !t.copy_details }))}
-                  title="Whether mirrors may show meeting subjects and locations from this tenant"
+                  title="Whether users' calendars may show meeting subjects and locations from this tenant"
                 >
                   {t.copy_details ? "Hide details" : "Show details"}
                 </Button>
@@ -183,32 +183,28 @@ function Tenants({ onChange }: { onChange: () => Promise<void> }) {
 function Users({ me }: { me: Me }) {
   const users = useResource<AdminUser[]>("/api/admin/users", 10_000);
   const [error, setError] = useState<string>();
-  const [notice, setNotice] = useState<string>();
-  const assignable = me.primary.mode === "user_mailbox";
+  const [busy, setBusy] = useState<string>();
 
-  async function act(action: () => Promise<unknown>, message?: string) {
+  async function setOperator(user: AdminUser, isOperator: boolean) {
     setError(undefined);
-    setNotice(undefined);
+    setBusy(user.id);
     try {
-      await action();
-      if (message) setNotice(message);
+      await patch(`/api/admin/users/${user.id}`, { is_operator: isOperator });
       await users.reload();
     } catch (err) {
       setError((err as Error).message);
+    } finally {
+      setBusy(undefined);
     }
   }
 
   return (
     <div className="space-y-4">
-      <p className="text-sm text-slate-600">
-        Primary calendar hosting: <b>{me.primary.mode === "shared_mailbox" ? "one calendar per user in a shared mailbox" : "a mailbox per user, assigned here"}</b>.
-      </p>
       <ErrorNote error={error ?? users.error} />
-      {notice && <div className="rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-800">{notice}</div>}
       {!users.data ? (
         <Spinner />
       ) : (
-        <Table head={["User", "Primary calendar", "Sources", "Mirrors", "Joined", ""]}>
+        <Table head={["User", "Sources", "Events", "Joined", ""]}>
           {users.data.map((u) => (
             <tr key={u.id}>
               <Td>
@@ -220,25 +216,18 @@ function Users({ me }: { me: Me }) {
                   </div>
                 )}
               </Td>
-              <Td>
-                <StatusBadge status={u.primary_status} />
-                <div className="mt-1 text-xs text-slate-500">{u.primary_mailbox ?? "—"}</div>
-                {u.primary_error && <div className="mt-1 max-w-64 text-xs text-rose-700">{u.primary_error}</div>}
-                {assignable && <AssignMailbox user={u} onAssign={(m) => act(() => patch(`/api/admin/users/${u.id}`, { primary_mailbox: m }))} />}
-              </Td>
               <Td className="tabular-nums">{u.source_count}</Td>
-              <Td className="tabular-nums">{u.mirror_count}</Td>
+              <Td className="tabular-nums">{u.event_count}</Td>
               <Td>{relativeTime(u.created_at)}</Td>
-              <Td className="space-x-1.5 whitespace-nowrap text-right">
-                <Button size="sm" onClick={() => act(() => post(`/api/admin/users/${u.id}/provision`), "Provisioning queued")}>
-                  Re-provision
-                </Button>
+              <Td className="whitespace-nowrap text-right">
                 <Button
                   size="sm"
-                  title="Re-check every mirror and recreate any deleted from Outlook"
-                  onClick={() => act(() => post(`/api/admin/users/${u.id}/rebuild`), "Rebuild queued")}
+                  // The API refuses to remove your own operator access.
+                  disabled={busy === u.id || (u.id === me.id && u.is_operator)}
+                  title={u.id === me.id && u.is_operator ? "You can't remove your own operator access" : undefined}
+                  onClick={() => setOperator(u, !u.is_operator)}
                 >
-                  Rebuild mirrors
+                  {u.is_operator ? "Remove operator" : "Make operator"}
                 </Button>
               </Td>
             </tr>
@@ -246,27 +235,6 @@ function Users({ me }: { me: Me }) {
         </Table>
       )}
     </div>
-  );
-}
-
-function AssignMailbox({ user, onAssign }: { user: AdminUser; onAssign: (mailbox: string) => void }) {
-  const [value, setValue] = useState(user.primary_mailbox ?? "");
-  return (
-    <form
-      className="mt-2 flex gap-1.5"
-      onSubmit={(e) => {
-        e.preventDefault();
-        if (value.trim()) onAssign(value.trim());
-      }}
-    >
-      <input
-        value={value}
-        onChange={(e) => setValue(e.target.value)}
-        placeholder="mailbox@yourtenant.com"
-        className="w-52 rounded-md border border-slate-300 px-2 py-1 text-xs"
-      />
-      <Button size="sm">Assign</Button>
-    </form>
   );
 }
 

@@ -66,7 +66,7 @@ services:
       timeout: 5s
       retries: 10
 
-  # Queue consumers: fetch-on-notify, delta sync, mirror writes, subscriptions.
+  # Queue consumers: fetch-on-notify, delta sync, subscriptions, unlink clean-up.
   # Scale horizontally: docker compose up --scale worker=4
   worker:
     <<: *backend
@@ -82,7 +82,7 @@ services:
       timeout: 10s
       retries: 5
 
-  # Cron sweeps: subscription renewal, periodic delta, mirror audit. Only enqueues work.
+  # Cron sweeps: subscription renewal, periodic delta. Only enqueues work.
   scheduler:
     <<: *backend
     command: ["arq", "app.worker.settings.SchedulerSettings"]

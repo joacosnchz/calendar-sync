@@ -15,7 +15,7 @@ from sqlalchemy.orm import selectinload
 from app.graph.client import GraphGone, GraphNotFound
 from app.metrics import DELTA_DRIFT
 from app.models import LinkedSource, SourceEvent, SourceStatus, Subscription
-from app.queue import reconcile_key, sync_key
+from app.queue import sync_key
 from app.services import Services
 from app.sync.events import normalize_event, to_row
 from app.timeutil import sync_window, utcnow
@@ -46,7 +46,7 @@ class SyncResult:
 async def upsert_event(
     session: AsyncSession, source_id: uuid.UUID, raw: dict[str, Any], *, authoritative: bool
 ) -> set[str]:
-    """Store one event. Returns the dedup keys whose mirror may need to change.
+    """Store one event. Returns the dedup keys of the unified-calendar entries that changed.
 
     Notification path: only overwrite when Graph's lastModifiedDateTime is newer, which
     makes duplicate and out-of-order notifications harmless. Delta path is
@@ -101,21 +101,14 @@ async def apply_event(
     *,
     authoritative: bool,
 ) -> tuple[set[str], bool]:
-    """Returns (changed keys, needs_delta). Series masters aren't mirrored directly: their
+    """Returns (changed keys, needs_delta). Series masters aren't stored directly: their
     occurrences come from calendarView, so a change to one triggers a delta instead."""
     event = normalize_event(raw)
     if event.event_type == "seriesMaster":
         return set(), True
-    if not event.is_mirrorable() or not event.overlaps(*window):
+    if not event.should_store() or not event.overlaps(*window):
         return await delete_events(session, source_id, [event.graph_event_id]), False
     return await upsert_event(session, source_id, raw, authoritative=authoritative), False
-
-
-async def enqueue_reconciles(services: Services, user_id: uuid.UUID, keys: set[str]) -> None:
-    for key in keys:
-        await services.queue.enqueue_coalesced(
-            reconcile_key(user_id, key), "reconcile_group", str(user_id), key
-        )
 
 
 def current_window(services: Services) -> tuple[datetime, datetime]:
@@ -163,7 +156,6 @@ async def process_notification(services: Services, graph_subscription_id: str, r
             )
         await session.commit()
 
-    await enqueue_reconciles(services, source.user_id, keys)
     if needs_delta:
         await services.queue.enqueue_coalesced(
             sync_key(source.id, SyncMode.RECOVERY), "sync_source", str(source.id), SyncMode.RECOVERY.value
@@ -202,9 +194,6 @@ async def sync_source(services: Services, source_id: uuid.UUID, mode: SyncMode) 
         if mode in (SyncMode.RECOVERY, SyncMode.SCHEDULED) and result.changed_keys:
             DELTA_DRIFT.labels(source.tenant.tenant_id).inc(len(result.changed_keys))
             log.warning("delta drift source=%s mode=%s changes=%d", source.id, mode, len(result.changed_keys))
-        user_id = source.user_id
-
-    await enqueue_reconciles(services, user_id, result.changed_keys)
     return result
 
 

@@ -1,18 +1,19 @@
 "use client";
 
+import Link from "next/link";
 import { useState } from "react";
 
 import { AppShell } from "@/components/AppShell";
 import { Badge, Button, Card, ErrorNote, LinkButton, Spinner, StatusBadge } from "@/components/ui";
-import { del, navigate, patch, post, type Me, type Source } from "@/lib/api";
+import { del, navigate, patch, post, type Source } from "@/lib/api";
 import { dateTime, labelColors, reauthSummary, relativeTime, type LabelColor } from "@/lib/format";
 import { useResource } from "@/lib/hooks";
 
 export default function DashboardPage() {
-  return <AppShell>{(me) => <Dashboard me={me} />}</AppShell>;
+  return <AppShell>{() => <Dashboard />}</AppShell>;
 }
 
-function Dashboard({ me }: { me: Me }) {
+function Dashboard() {
   // Poll so linking, backfill and unlinking progress show up without a refresh.
   const sources = useResource<Source[]>("/api/sources", 5000);
   const needReauth = sources.data?.filter((s) => s.status === "reauth_required") ?? [];
@@ -25,14 +26,16 @@ function Dashboard({ me }: { me: Me }) {
         <div>
           <h1 className="text-2xl font-semibold text-slate-900">Linked accounts</h1>
           <p className="mt-1 text-sm text-slate-600">
-            Calendars you own in other organizations. We only ever read them; changes appear in your unified
-            calendar within seconds.
+            Calendars you own in other organizations. We only ever read them; their events come together on
+            your{" "}
+            <Link href="/calendar" className="font-medium text-brand-600 hover:text-brand-700">
+              Calendar
+            </Link>{" "}
+            and changes appear within seconds.
           </p>
         </div>
         <LinkButton href="/auth/link">+ Link an account</LinkButton>
       </div>
-
-      <PrimaryCard me={me} />
 
       <ErrorNote error={sources.error} />
       {sources.loading && !sources.data ? (
@@ -75,8 +78,8 @@ function ReauthBanner({ sources }: { sources: Source[] }) {
       <div className="min-w-0 flex-1">
         <div className="font-medium">{reauthSummary(sources.length)}</div>
         <p className="mt-0.5 text-sm">
-          Syncing is paused for {sources.map((s) => s.source_email).join(", ")}. Events already in your unified
-          calendar stay there, but new changes won&apos;t appear until you reconnect
+          Syncing is paused for {sources.map((s) => s.source_email).join(", ")}. Events already synced stay in
+          your calendar, but new changes won&apos;t appear until you reconnect
           {sources.length > 1 ? " each account below." : "."}
         </p>
       </div>
@@ -88,37 +91,6 @@ function ReauthBanner({ sources }: { sources: Source[] }) {
 // The backend always sets reauth_url for reauth_required sources; fall back to the route it points at.
 function reauthHref(source: Source) {
   return source.reauth_url ?? `/auth/reauth/${source.id}`;
-}
-
-function PrimaryCard({ me }: { me: Me }) {
-  const { status, mailbox, error, mode } = me.primary;
-  return (
-    <Card className="flex flex-wrap items-center gap-4 p-5">
-      <div className="grid h-10 w-10 place-items-center rounded-lg bg-brand-50 text-brand-600">
-        <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth={2}>
-          <rect x="3" y="5" width="18" height="16" rx="2" />
-          <path d="M3 10h18" />
-        </svg>
-      </div>
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <span className="font-medium text-slate-900">Your unified calendar</span>
-          <StatusBadge status={status} />
-        </div>
-        <div className="mt-0.5 text-sm text-slate-600">
-          {status === "ready" && mailbox
-            ? mode === "shared_mailbox"
-              ? `Calendar "${me.display_name || me.email}" in ${mailbox}`
-              : `Primary calendar of ${mailbox}`
-            : status === "unassigned"
-              ? "An operator is assigning your calendar. Linked accounts will start mirroring once it's ready."
-              : status === "provisioning"
-                ? "Setting up your calendar…"
-                : error}
-        </div>
-      </div>
-    </Card>
-  );
 }
 
 function SourceCard({
@@ -185,7 +157,7 @@ function SourceCard({
                 <button
                   className="text-xs text-slate-500 hover:text-slate-800"
                   onClick={() => setEditing(true)}
-                  title="Rename the label shown on mirrored events"
+                  title="Rename the label shown on this account's events in your calendar"
                 >
                   Rename
                 </button>
@@ -209,7 +181,7 @@ function SourceCard({
               variant="danger"
               disabled={!!busy}
               onClick={() => {
-                if (confirm(`Unlink ${source.source_email}? Its events will be removed from your unified calendar.`)) {
+                if (confirm(`Unlink ${source.source_email}? Its events will be removed from your calendar.`)) {
                   void run("unlink", () => del(`/api/sources/${source.id}`));
                 }
               }}
@@ -229,8 +201,8 @@ function SourceCard({
               {source.reauth_required_at && (
                 <span title={dateTime(source.reauth_required_at)}>{relativeTime(source.reauth_required_at)} </span>
               )}
-              because our access to this calendar expired or was revoked. Events already mirrored from it stay in your
-              unified calendar; once you reconnect, changes made in the meantime are caught up automatically.
+              because our access to this calendar expired or was revoked. Events already synced from it stay in your
+              calendar; once you reconnect, changes made in the meantime are caught up automatically.
             </p>
             {source.last_error && <p className="mt-2 text-xs text-amber-800">Reason: {source.last_error}</p>}
           </div>
@@ -240,7 +212,7 @@ function SourceCard({
 
       {source.status === "active" && (
         <dl className="mt-4 grid grid-cols-2 gap-x-6 gap-y-3 border-t border-slate-100 pt-4 text-sm sm:grid-cols-4">
-          <Metric label="Events mirrored" value={source.event_count.toString()} />
+          <Metric label="Events" value={source.event_count.toString()} />
           <Metric
             label="Last change received"
             value={relativeTime(source.last_notification_at)}
@@ -292,14 +264,14 @@ function DangerZone() {
       <div>
         <div className="font-medium text-slate-900">Delete account</div>
         <p className="text-sm text-slate-600">
-          Removes every mirrored event, your unified calendar and all data we store about you.
+          Removes your linked accounts and all data we store about you, including their synced events.
         </p>
       </div>
       <Button
         variant="danger"
         disabled={busy}
         onClick={async () => {
-          if (!confirm("Delete your account and remove all mirrored events? This can't be undone.")) return;
+          if (!confirm("Delete your account, your linked accounts and all data we store about you? This can't be undone.")) return;
           setBusy(true);
           await del("/api/me");
           navigate("/");

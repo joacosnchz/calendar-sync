@@ -12,12 +12,12 @@ from sqlalchemy.orm import selectinload
 from app.api import schemas
 from app.api.deps import csrf_protect, current_user, get_services, get_session
 from app.audit import audit
-from app.models import LinkedSource, MirrorMapping, SourceEvent, SourceStatus, Tenant, User
+from app.models import LinkedSource, SourceEvent, SourceStatus, Tenant, User
 from app.queue import sync_key
 from app.security import SESSION_COOKIE
 from app.services import Services
-from app.sync.mirror import SHOW_AS_RANK
-from app.sync.source_sync import SyncMode, enqueue_reconciles
+from app.sync.events import busiest
+from app.sync.source_sync import SyncMode
 
 router = APIRouter(prefix="/api", tags=["me"], dependencies=[Depends(csrf_protect)])
 
@@ -60,18 +60,9 @@ async def _owned_source(session: AsyncSession, user: User, source_id: uuid.UUID)
 
 
 @router.get("/me", response_model=schemas.MeOut)
-async def me(user: User = Depends(current_user), services: Services = Depends(get_services)) -> schemas.MeOut:
+async def me(user: User = Depends(current_user)) -> schemas.MeOut:
     return schemas.MeOut(
-        id=user.id,
-        email=user.email,
-        display_name=user.display_name,
-        is_operator=user.is_operator,
-        primary=schemas.PrimaryOut(
-            status=user.primary_status,
-            mailbox=user.primary_mailbox,
-            error=user.primary_error,
-            mode=services.settings.primary_calendar_mode,
-        ),
+        id=user.id, email=user.email, display_name=user.display_name, is_operator=user.is_operator
     )
 
 
@@ -120,20 +111,16 @@ async def update_source(
     source_id: uuid.UUID,
     body: schemas.SourceUpdate,
     user: User = Depends(current_user),
-    services: Services = Depends(get_services),
     session: AsyncSession = Depends(get_session),
 ) -> schemas.SourceOut:
     source = await _owned_source(session, user, source_id)
-    changed = source.label != body.label
     source.label = body.label
     await session.commit()
-    keys = set(
-        (await session.scalars(select(SourceEvent.dedup_key).where(SourceEvent.source_id == source.id))).all()
+    # Labels are applied when the calendar is read, so there's nothing else to update.
+    count = await session.scalar(
+        select(func.count()).select_from(SourceEvent).where(SourceEvent.source_id == source.id)
     )
-    if changed:
-        # Labels appear on mirrors, so re-render them.
-        await enqueue_reconciles(services, user.id, keys)
-    return source_out(source, len(keys))
+    return source_out(source, count or 0)
 
 
 @router.delete("/sources/{source_id}", status_code=202)
@@ -176,7 +163,8 @@ async def unified_calendar(
     user: User = Depends(current_user),
     session: AsyncSession = Depends(get_session),
 ) -> list[schemas.CalendarEventOut]:
-    """The user's unified view, grouped exactly as it is mirrored (one entry per group)."""
+    """The unified calendar: every visible source's stored events, one entry per meeting
+    (copies in several sources share a dedup key, FR-14)."""
     if end <= start or end - start > timedelta(days=62):
         raise HTTPException(400, "Range must be positive and at most 62 days")
     rows = (
@@ -186,21 +174,12 @@ async def unified_calendar(
             .join(Tenant, Tenant.id == LinkedSource.tenant_pk)
             .where(
                 LinkedSource.user_id == user.id,
-                LinkedSource.status.in_(SourceStatus.MIRRORED),
+                LinkedSource.status.in_(SourceStatus.VISIBLE),
                 SourceEvent.start_utc < end,
                 SourceEvent.end_utc > start,
             )
         )
     ).all()
-    mirrored = set(
-        (
-            await session.scalars(
-                select(MirrorMapping.dedup_key).where(
-                    MirrorMapping.user_id == user.id, MirrorMapping.graph_event_id.is_not(None)
-                )
-            )
-        ).all()
-    )
     groups: dict[str, list] = defaultdict(list)
     for ev, label, copy_details in rows:
         groups[ev.dedup_key].append((ev, label, copy_details))
@@ -217,10 +196,9 @@ async def unified_calendar(
                 start=canonical.start_utc,
                 end=canonical.end_utc,
                 is_all_day=canonical.is_all_day,
-                show_as=max((m[0].show_as for m in members), key=lambda s: SHOW_AS_RANK.get(s, 3)),
+                show_as=busiest(m[0].show_as for m in members),
                 labels=sorted({m[1] for m in members}),
                 source_ids=sorted({m[0].source_id for m in members}),
-                mirrored=key in mirrored,
             )
         )
     return sorted(out, key=lambda e: (e.start, e.end))

@@ -7,11 +7,10 @@ from typing import Any
 
 from sqlalchemy import or_, select
 
-from app.models import LinkedSource, PrimaryStatus, SourceStatus, Subscription, User
+from app.models import LinkedSource, SourceStatus, Subscription
 from app.queue import renew_key, sync_key
 from app.services import Services
-from app.sync.mirror import stale_dedup_keys
-from app.sync.source_sync import SyncMode, enqueue_reconciles
+from app.sync.source_sync import SyncMode
 from app.timeutil import utcnow
 
 log = logging.getLogger(__name__)
@@ -74,35 +73,3 @@ async def delta_sweep(ctx: dict[str, Any]) -> str:
             sync_key(source_id, SyncMode.SCHEDULED), "sync_source", str(source_id), SyncMode.SCHEDULED.value
         )
     return f"queued={len(due)}"
-
-
-async def mirror_audit_sweep(ctx: dict[str, Any]) -> str:
-    """Re-reconcile any group whose mirror may be behind stored state (e.g. a write that
-    exhausted its retries), and remove mirrors whose sources are gone."""
-    services: Services = ctx["services"]
-    total = 0
-    async with services.sessionmaker() as session:
-        users = (
-            await session.scalars(select(User.id).where(User.primary_status == PrimaryStatus.READY))
-        ).all()
-        for user_id in users:
-            keys = await stale_dedup_keys(session, user_id)
-            total += len(keys)
-            await enqueue_reconciles(services, user_id, keys)
-    return f"stale={total}"
-
-
-async def provisioning_sweep(ctx: dict[str, Any]) -> str:
-    services: Services = ctx["services"]
-    async with services.sessionmaker() as session:
-        stuck = (
-            await session.scalars(
-                select(User.id).where(
-                    User.primary_status == PrimaryStatus.PROVISIONING,
-                    User.updated_at < utcnow() - SETUP_GRACE,
-                )
-            )
-        ).all()
-    for user_id in stuck:
-        await services.queue.enqueue_coalesced(f"provision:{user_id}", "provision_primary", str(user_id))
-    return f"retried={len(stuck)}"

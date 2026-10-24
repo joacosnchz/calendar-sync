@@ -18,7 +18,6 @@ from mockgraph.state import (
     MockUser,
     now_utc,
     parse_any,
-    public_event,
     seed,
     seed_events,
 )
@@ -26,12 +25,8 @@ from mockgraph.state import (
 
 def state_from_env() -> MockState:
     return MockState(
-        home_tenant_id=os.environ.get("HOME_TENANT_ID", "11111111-1111-4111-8111-111111111111"),
         source_app_id=os.environ["SOURCE_APP_CLIENT_ID"],
         source_app_secret=os.environ["SOURCE_APP_CLIENT_SECRET"],
-        primary_app_id=os.environ["PRIMARY_APP_CLIENT_ID"],
-        primary_app_secret=os.environ["PRIMARY_APP_CLIENT_SECRET"],
-        shared_mailbox=os.environ.get("PRIMARY_SHARED_MAILBOX", "calendars@calsync.example"),
     )
 
 
@@ -93,7 +88,7 @@ def create_mock_app(state: MockState | None = None, *, seed_demo: bool = True) -
             if tenant in ("organizations", "common") or s.find_tenant(tenant) is t
         ]
         hint = (q.get("login_hint") or "").lower()
-        accounts = [(t, u) for t in tenants for u in t.users.values() if u.upn != s.shared_mailbox]
+        accounts = [(t, u) for t in tenants for u in t.users.values()]
         # login_hint: offer that account first, the rest under "Use another account".
         hinted = [(t, u) for t, u in accounts if u.upn == hint]
         others = [(t, u) for t, u in accounts if u.upn != hint]
@@ -219,7 +214,7 @@ def create_mock_app(state: MockState | None = None, *, seed_demo: bool = True) -
 
     # -- Graph ------------------------------------------------------------------------
 
-    def graph_auth(request: Request, *, write: bool = False) -> dict[str, Any]:
+    def graph_auth(request: Request) -> dict[str, Any]:
         s = st(request)
         header = request.headers.get("authorization", "")
         if not header.startswith("Bearer "):
@@ -233,10 +228,6 @@ def create_mock_app(state: MockState | None = None, *, seed_demo: bool = True) -
                 "TooManyRequests",
                 "Application is over its MailboxConcurrency limit.",
                 {"Retry-After": "2"},
-            )
-        if write and claims["appid"] != s.primary_app_id:
-            raise MockGraphError(
-                403, "ErrorAccessDenied", "Access is denied. Check credentials and try again."
             )
         return claims
 
@@ -274,26 +265,6 @@ def create_mock_app(state: MockState | None = None, *, seed_demo: bool = True) -
         claims = graph_auth(request)
         return calendar_json(st(request).calendar_for(mailbox(request, claims, uid), cid))
 
-    @app.post("/v1.0/users/{uid}/calendars", status_code=201)
-    async def create_calendar(request: Request, uid: str) -> dict:
-        from mockgraph.state import MockCalendar
-
-        claims = graph_auth(request, write=True)
-        user = mailbox(request, claims, uid)
-        body = await request.json()
-        cal = MockCalendar(
-            id=f"cal-{secrets.token_hex(8)}", owner_oid=user.oid, name=body.get("name", "Calendar")
-        )
-        st(request).calendars[cal.id] = cal
-        return calendar_json(cal)
-
-    @app.delete("/v1.0/users/{uid}/calendars/{cid}", status_code=204)
-    async def delete_calendar(request: Request, uid: str, cid: str) -> Response:
-        claims = graph_auth(request, write=True)
-        cal = st(request).calendar_for(mailbox(request, claims, uid), cid)
-        del st(request).calendars[cal.id]
-        return Response(status_code=204)
-
     def page_size(request: Request) -> int:
         prefer = request.headers.get("prefer", "")
         for part in prefer.split(","):
@@ -317,31 +288,7 @@ def create_mock_app(state: MockState | None = None, *, seed_demo: bool = True) -
     async def get_event(request: Request, uid: str, eid: str) -> dict:
         claims = graph_auth(request)
         _, event = st(request).find_event(mailbox(request, claims, uid), eid)
-        return public_event(event)
-
-    @app.post("/v1.0/users/{uid}/calendars/{cid}/events", status_code=201)
-    async def create_event_in(request: Request, uid: str, cid: str) -> dict:
-        claims = graph_auth(request, write=True)
-        user = mailbox(request, claims, uid)
-        return public_event(await st(request).create_event(user, await request.json(), calendar_id=cid))
-
-    @app.post("/v1.0/users/{uid}/events", status_code=201)
-    async def create_event_default(request: Request, uid: str) -> dict:
-        claims = graph_auth(request, write=True)
-        user = mailbox(request, claims, uid)
-        return public_event(await st(request).create_event(user, await request.json()))
-
-    @app.patch("/v1.0/users/{uid}/events/{eid}")
-    async def patch_event(request: Request, uid: str, eid: str) -> dict:
-        claims = graph_auth(request, write=True)
-        user = mailbox(request, claims, uid)
-        return public_event(await st(request).update_event(user, eid, await request.json()))
-
-    @app.delete("/v1.0/users/{uid}/events/{eid}", status_code=204)
-    async def remove_event(request: Request, uid: str, eid: str) -> Response:
-        claims = graph_auth(request, write=True)
-        await st(request).delete_event(mailbox(request, claims, uid), eid)
-        return Response(status_code=204)
+        return event
 
     @app.post("/v1.0/subscriptions", status_code=201)
     async def create_subscription(request: Request) -> dict:
@@ -547,7 +494,7 @@ def render_panel(s: MockState) -> str:
         "<p class='muted'>Stand-in for login.microsoftonline.com and graph.microsoft.com. "
         "Changes here fire change notifications to subscribed webhooks, like real Graph.</p>"
     ]
-    users = [u for t in s.tenants.values() if not t.is_home for u in t.users.values()]
+    users = [u for t in s.tenants.values() for u in t.users.values()]
     options = "".join(f"<option value='{esc(u.upn)}'>{esc(u.upn)}</option>" for u in users)
     tomorrow = (now_utc() + timedelta(days=1)).strftime("%Y-%m-%d")
     out.append(
@@ -572,8 +519,6 @@ def render_panel(s: MockState) -> str:
             if t.user_consent_blocked
             else "<span class='pill ok'>users can consent</span>"
         )
-        if t.is_home:
-            badge = "<span class='pill'>host tenant · primary calendars</span>"
         flags = []
         if t.drop_notifications:
             flags.append("<span class='pill bad'>dropping notifications</span>")
@@ -583,60 +528,54 @@ def render_panel(s: MockState) -> str:
             f"<h2>{esc(t.name)} <small>{esc(t.domain)} · <code>{t.tenant_id}</code></small></h2>"
             f"<div>{badge} {' '.join(flags)}</div>"
         )
-        if not t.is_home:
-            buttons = [
-                ("consent_block", "Toggle blocking user consent"),
-                ("throttle", "Throttle next 5 calls"),
-                ("drop", "Toggle dropping notifications"),
-                ("missed", "Send 'missed'"),
-                ("subscriptionRemoved", "Send 'subscriptionRemoved'"),
-                ("reauthorizationRequired", "Send 'reauthorizationRequired'"),
-            ]
-            out.append(
-                "<div style='margin:8px 0'>"
-                + " ".join(
-                    f"<form class='inline' method='post' action='/mock/tenants/{t.tenant_id}'>"
-                    f"<button class='secondary' name='action' value='{a}'>{label}</button></form>"
-                    for a, label in buttons
-                )
-                + "</div>"
+        buttons = [
+            ("consent_block", "Toggle blocking user consent"),
+            ("throttle", "Throttle next 5 calls"),
+            ("drop", "Toggle dropping notifications"),
+            ("missed", "Send 'missed'"),
+            ("subscriptionRemoved", "Send 'subscriptionRemoved'"),
+            ("reauthorizationRequired", "Send 'reauthorizationRequired'"),
+        ]
+        out.append(
+            "<div style='margin:8px 0'>"
+            + " ".join(
+                f"<form class='inline' method='post' action='/mock/tenants/{t.tenant_id}'>"
+                f"<button class='secondary' name='action' value='{a}'>{label}</button></form>"
+                for a, label in buttons
             )
+            + "</div>"
+        )
         for u in t.users.values():
             cals = [c for c in s.calendars.values() if c.owner_oid == u.oid]
             for cal in cals:
                 events = sorted(cal.events.values(), key=lambda e: e["start"]["dateTime"])
-                if t.is_home and u.upn != s.shared_mailbox and not events:
-                    continue
                 title = f"{esc(u.display_name)} <small>{esc(u.upn)} · {esc(cal.name)}</small>"
-                if not t.is_home:
-                    scopes = sorted(s.grants.get((u.oid, s.source_app_id), set()))
-                    tokens = sum(1 for g in s.refresh_tokens.values() if g.oid == u.oid)
-                    title += (
-                        f" <small>· granted: {esc(' '.join(scopes)) or 'nothing'} · {tokens} refresh token(s)"
-                        "</small>"
-                        f"<form class='inline' method='post' action='/mock/users/{u.oid}/revoke'> "
-                        "<button class='secondary'>Revoke refresh tokens</button></form>"
-                        f"<form class='inline' method='post' action='/mock/users/{u.oid}/revoke'>"
-                        "<input type='hidden' name='consent' value='1'> "
-                        "<button class='secondary'>Withdraw consent</button></form>"
-                    )
+                scopes = sorted(s.grants.get((u.oid, s.source_app_id), set()))
+                tokens = sum(1 for g in s.refresh_tokens.values() if g.oid == u.oid)
+                title += (
+                    f" <small>· granted: {esc(' '.join(scopes)) or 'nothing'} · {tokens} refresh token(s)"
+                    "</small>"
+                    f"<form class='inline' method='post' action='/mock/users/{u.oid}/revoke'> "
+                    "<button class='secondary'>Revoke refresh tokens</button></form>"
+                    f"<form class='inline' method='post' action='/mock/users/{u.oid}/revoke'>"
+                    "<input type='hidden' name='consent' value='1'> "
+                    "<button class='secondary'>Withdraw consent</button></form>"
+                )
                 rows = []
                 for ev in events:
-                    actions = ""
-                    if not t.is_home:
-                        invite = "".join(
-                            f"<option value='{o.oid}'>{esc(o.upn)}</option>" for o in users if o.oid != u.oid
-                        )
-                        actions = (
-                            f"<form class='inline' method='post' action='/mock/events/{u.oid}/{ev['id']}'>"
-                            "<button class='secondary' name='action' value='later'>+1h</button> "
-                            "<button class='secondary' name='action' value='rename'>Rename</button> "
-                            "<button class='secondary' name='action' value='tentative'>Tentative⇄Free</button> "
-                            "<button class='secondary' name='action' value='cancel'>Cancel</button> "
-                            "<button class='secondary' name='action' value='delete'>Delete</button> "
-                            f"<select name='target'>{invite}</select> "
-                            "<button class='secondary' name='action' value='invite'>Invite</button></form>"
-                        )
+                    invite = "".join(
+                        f"<option value='{o.oid}'>{esc(o.upn)}</option>" for o in users if o.oid != u.oid
+                    )
+                    actions = (
+                        f"<form class='inline' method='post' action='/mock/events/{u.oid}/{ev['id']}'>"
+                        "<button class='secondary' name='action' value='later'>+1h</button> "
+                        "<button class='secondary' name='action' value='rename'>Rename</button> "
+                        "<button class='secondary' name='action' value='tentative'>Tentative⇄Free</button> "
+                        "<button class='secondary' name='action' value='cancel'>Cancel</button> "
+                        "<button class='secondary' name='action' value='delete'>Delete</button> "
+                        f"<select name='target'>{invite}</select> "
+                        "<button class='secondary' name='action' value='invite'>Invite</button></form>"
+                    )
                     cancelled = " <span class='pill bad'>cancelled</span>" if ev.get("isCancelled") else ""
                     rows.append(
                         f"<tr><td>{esc(ev['subject'])}{cancelled}<br><small>{esc(ev['location'].get('displayName', ''))}"

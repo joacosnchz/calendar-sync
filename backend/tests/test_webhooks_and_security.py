@@ -7,7 +7,7 @@ import pytest
 
 from app.graph.client import GraphForbidden, GraphNotFound, GraphThrottled, ReadOnlyViolation
 from app.graph.oidc import needs_admin_approval
-from app.graph.tokens import App, TokenError, is_reauth_error
+from app.graph.tokens import TokenError, is_reauth_error
 from app.security import (
     InvalidToken,
     issue_oauth_state,
@@ -16,7 +16,7 @@ from app.security import (
     read_session,
     safe_next_path,
 )
-from tests.harness import HOME_TENANT, SOURCE_APP, Harness, make_settings, tenant_of
+from tests.harness import SOURCE_APP, Harness, make_settings, tenant_of
 from tests.test_sync_flow import link_and_sync
 
 # --- webhook receiver ----------------------------------------------------------------
@@ -124,33 +124,20 @@ async def test_source_app_cannot_write(harness: Harness, operator, alice):
     for method in ("POST", "PATCH", "DELETE", "PUT"):
         with pytest.raises(ReadOnlyViolation):
             await graph.request(
-                method,
-                "users/x/events/y",
-                app=App.SOURCE,
-                tenant_id=tenant_id,
-                scope=f"tenant:{tenant_id}",
-                source_id=source.id,
-                json={},
+                method, "users/x/events/y", source_id=source.id, scope=f"tenant:{tenant_id}", json={}
             )
     # Reads and subscription management are allowed.
     with pytest.raises(GraphNotFound):
         await graph.source(source.id, tenant_id).delete_subscription(str(uuid.uuid4()))
 
 
-async def test_primary_app_only_in_home_tenant(harness: Harness):
-    with pytest.raises(TokenError):
-        await harness.services.tokens.get_token(App.PRIMARY, tenant_of(harness.mock, "alice@contoso.example"))
-    assert await harness.services.tokens.get_token(App.PRIMARY, HOME_TENANT)
-
-
 async def test_source_app_cannot_use_client_credentials(harness: Harness):
     contoso = tenant_of(harness.mock, "alice@contoso.example")
-    # Our token service never asks for app-only source tokens...
-    with pytest.raises(TokenError):
-        await harness.services.tokens.get_token(App.SOURCE, contoso)
+    # Our token service has no app-only tokens at all...
+    assert not hasattr(harness.services.tokens, "get_token")
     # ...and the identity platform refuses them: the app has no application permissions.
     async with harness.mock_client() as mock:
-        for tenant in (contoso, HOME_TENANT):
+        for tenant in (contoso, tenant_of(harness.mock, "ops@calsync.example")):
             resp = await mock.post(
                 f"/{tenant}/oauth2/v2.0/token",
                 data={
@@ -340,11 +327,11 @@ def test_session_and_state_tokens_are_not_interchangeable():
 @pytest.mark.parametrize(
     "value,expected",
     [
-        ("/calendar", "/calendar"),
-        ("//evil.example", "/dashboard"),
-        ("https://evil.example", "/dashboard"),
-        ("/\\evil", "/dashboard"),
-        (None, "/dashboard"),
+        ("/dashboard", "/dashboard"),
+        ("//evil.example", "/calendar"),
+        ("https://evil.example", "/calendar"),
+        ("/\\evil", "/calendar"),
+        (None, "/calendar"),
     ],
 )
 def test_safe_next_path(value, expected):
@@ -383,4 +370,21 @@ async def test_login_rejects_forged_state(harness: Harness):
 
 async def test_operator_assigned_from_config(harness: Harness, operator, alice):
     assert (await operator.get("/api/me")).json()["is_operator"] is True
-    assert (await alice.get("/api/me")).json()["is_operator"] is False
+    me = (await alice.get("/api/me")).json()
+    assert me == {
+        "id": str((await harness.user("alice@contoso.example")).id),
+        "email": "alice@contoso.example",
+        "display_name": "Alice Martin",
+        "is_operator": False,
+    }
+
+
+async def test_sign_in_lands_on_the_calendar(harness: Harness):
+    h = harness
+    async with h.client() as browser:
+        resp = await h._oauth_roundtrip(browser, "/auth/login", "alice@contoso.example")
+        assert resp.headers["location"] == "http://web.test/calendar"
+        resp = await h._oauth_roundtrip(browser, "/auth/login?next=/dashboard", "alice@contoso.example")
+        assert resp.headers["location"] == "http://web.test/dashboard"
+    # Signing up doesn't queue anything: there is no calendar to provision.
+    assert h.queue.jobs == []

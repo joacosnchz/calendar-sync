@@ -24,8 +24,8 @@ function LinkResult() {
     return (
       <ResultPage tone="good" title="Account linked" action={back}>
         <p>
-          <b>{email}</b> is linked. We&apos;re copying its events into your unified calendar now; new changes will
-          appear within seconds.
+          <b>{email}</b> is linked. We&apos;re bringing its events into your calendar now; new changes will appear
+          within seconds.
         </p>
       </ResultPage>
     );

@@ -1,5 +1,4 @@
 from functools import lru_cache
-from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -38,20 +37,6 @@ class Settings(BaseSettings):
     source_app_cert_path: str | None = None
     source_app_cert_thumbprint: str | None = None
 
-    # Single-tenant app in our tenant: Calendars.ReadWrite (application), scoped by an
-    # application access policy to primary-calendar mailboxes.
-    home_tenant_id: str
-    primary_app_client_id: str
-    primary_app_client_secret: str | None = None
-    primary_app_cert_path: str | None = None
-    primary_app_cert_thumbprint: str | None = None
-
-    # How primary calendars are hosted (open question in the PRD, so both are supported):
-    #  shared_mailbox: one calendar per user inside primary_shared_mailbox
-    #  user_mailbox:   an operator assigns each user a mailbox; its default calendar is used
-    primary_calendar_mode: Literal["shared_mailbox", "user_mailbox"] = "shared_mailbox"
-    primary_shared_mailbox: str | None = None
-
     operator_emails: str = ""
 
     sync_window_past_days: int = 90
@@ -63,8 +48,6 @@ class Settings(BaseSettings):
     # A stored deltaLink is tied to the window it was created with. Re-baseline with a
     # fresh window once it is this old so the rolling window keeps moving.
     delta_rebaseline_hours: int = 24
-
-    mirror_label_in_subject: bool = True
 
     session_ttl_hours: int = 24 * 7
     metrics_port: int = 9100

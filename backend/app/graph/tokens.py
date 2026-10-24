@@ -1,12 +1,10 @@
-"""Access tokens for Microsoft Graph.
+"""Delegated access tokens for Microsoft Graph.
 
-PRIMARY (our tenant, Calendars.ReadWrite application permission): app-only tokens via the
-client credentials flow, requested from our tenant's endpoint and cached per tenant.
-
-SOURCE (customer tenants, delegated Calendars.Read): each linked source stores the
-refresh token its owner granted when they signed in. Access tokens are redeemed from it
-at the source's own tenant endpoint (never `common`), cached per source in Redis, and
-refreshed under a per-source lock so concurrent workers never race on a rotated token.
+Graph is only used to read source calendars (customer tenants, delegated Calendars.Read),
+and there are no app-only tokens. Each linked source stores the refresh token its owner
+granted when they signed in. Access tokens are redeemed from it at the source's own
+tenant endpoint (never `common`), cached per source in Redis, and refreshed under a
+per-source lock so concurrent workers never race on a rotated token.
 """
 
 import base64
@@ -15,7 +13,6 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from enum import StrEnum
 from pathlib import Path
 
 import httpx
@@ -32,7 +29,6 @@ from app.models import LinkedSource, Tenant
 
 log = logging.getLogger(__name__)
 
-GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 # What a source's refresh token is redeemed for. offline_access keeps rotation going.
 SOURCE_REFRESH_SCOPE = "https://graph.microsoft.com/Calendars.Read offline_access"
 REFRESH_MARGIN_SECONDS = 300
@@ -64,11 +60,6 @@ REAUTH_CODES = {
 
 def is_reauth_error(error: str | None, code: str | None) -> bool:
     return (error or "") in REAUTH_ERRORS or (code or "") in REAUTH_CODES
-
-
-class App(StrEnum):
-    SOURCE = "source"  # multi-tenant, delegated Calendars.Read
-    PRIMARY = "primary"  # our tenant only, Calendars.ReadWrite (application)
 
 
 class TokenError(Exception):
@@ -132,19 +123,13 @@ class AppCredentials:
         raise TokenError(f"No credentials configured for app {self.client_id}")
 
 
-def credentials_for(settings: Settings, app: App) -> AppCredentials:
-    if app is App.SOURCE:
-        return AppCredentials(
-            settings.source_app_client_id,
-            settings.source_app_client_secret,
-            settings.source_app_cert_path,
-            settings.source_app_cert_thumbprint,
-        )
+def source_app_credentials(settings: Settings) -> AppCredentials:
+    """The multi-tenant app users sign in and link calendars with (delegated only)."""
     return AppCredentials(
-        settings.primary_app_client_id,
-        settings.primary_app_client_secret,
-        settings.primary_app_cert_path,
-        settings.primary_app_cert_thumbprint,
+        settings.source_app_client_id,
+        settings.source_app_client_secret,
+        settings.source_app_cert_path,
+        settings.source_app_cert_thumbprint,
     )
 
 
@@ -209,39 +194,7 @@ class TokenService:
             )
         return body
 
-    # -- app-only (PRIMARY) -----------------------------------------------------------
-
-    def _key(self, app: App, tenant_id: str) -> str:
-        return f"token:{app}:{tenant_id}"
-
-    async def get_token(self, app: App, tenant_id: str) -> str:
-        if app is not App.PRIMARY:
-            raise TokenError("Source tenants are only accessed with delegated tokens (get_source_token)")
-        if tenant_id != self.settings.home_tenant_id:
-            raise TokenError("The write app only has access to our own tenant")
-        cached = await self.redis.get(self._key(app, tenant_id))
-        if cached:
-            return cached.decode() if isinstance(cached, bytes) else cached
-        creds = credentials_for(self.settings, app)
-        url = self._token_url(tenant_id)
-        body = await self._post(
-            url,
-            {
-                "grant_type": "client_credentials",
-                "client_id": creds.client_id,
-                "scope": GRAPH_SCOPE,
-                **creds.form(url),
-            },
-            tenant_id=tenant_id,
-        )
-        ttl = max(int(body.get("expires_in", 3600)) - REFRESH_MARGIN_SECONDS, 60)
-        await self.redis.set(self._key(app, tenant_id), body["access_token"], ex=ttl)
-        return body["access_token"]
-
-    async def invalidate(self, app: App, tenant_id: str) -> None:
-        await self.redis.delete(self._key(app, tenant_id))
-
-    # -- delegated (SOURCE) -----------------------------------------------------------
+    # -- per-source delegated tokens --------------------------------------------------
 
     @staticmethod
     def source_key(source_id: uuid.UUID) -> str:
@@ -340,7 +293,7 @@ class TokenService:
     async def redeem_refresh_token(
         self, tenant_id: str, refresh_token: str, *, source_id: uuid.UUID | None = None
     ) -> RefreshResult:
-        creds = credentials_for(self.settings, App.SOURCE)
+        creds = source_app_credentials(self.settings)
         url = self._token_url(tenant_id)
         body = await self._post(
             url,

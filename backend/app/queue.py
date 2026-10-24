@@ -21,10 +21,6 @@ def notification_key(subscription_id: str, resource_id: str) -> str:
     return f"notify:{subscription_id}:{_h(resource_id)}"
 
 
-def reconcile_key(user_id: uuid.UUID | str, dedup_key: str) -> str:
-    return f"reconcile:{user_id}:{_h(dedup_key)}"
-
-
 def sync_key(source_id: uuid.UUID | str, mode: str) -> str:
     return f"sync:{source_id}:{mode}"
 
