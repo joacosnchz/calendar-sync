@@ -1,4 +1,4 @@
-// Typed client for the FastAPI backend (proxied same-origin under /api and /auth).
+// Typed client for the backend (Supabase Edge Functions, proxied same-origin under /api and /auth).
 
 export interface Me {
   id: string;

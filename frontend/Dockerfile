@@ -5,8 +5,9 @@ RUN npm ci
 
 FROM node:24-alpine AS build
 WORKDIR /app
-ARG API_INTERNAL_URL=http://api:8000
-ENV API_INTERNAL_URL=$API_INTERNAL_URL NEXT_TELEMETRY_DISABLED=1
+# Rewrites are fixed at build time: rebuild the image for another Supabase project.
+ARG SUPABASE_FUNCTIONS_URL=http://host.docker.internal:54321/functions/v1
+ENV SUPABASE_FUNCTIONS_URL=$SUPABASE_FUNCTIONS_URL NEXT_TELEMETRY_DISABLED=1
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN npm run build
